@@ -1,0 +1,22 @@
+[project]
+name = "slugsam"
+version = "0.1.0"
+description = "Minimal standalone PySide6 front-end for interactive Segment Anything on microscopy images"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "pillow",
+    "pyside6",
+    "segment-anything",
+    "tifffile",
+    "imagecodecs",
+    "torch",
+    "torchvision",
+]
+
+[project.scripts]
+slugsam = "slugsam.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
