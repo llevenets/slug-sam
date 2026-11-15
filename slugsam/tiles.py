@@ -64,3 +64,12 @@ def core(shape: tuple[int, int], tile: Tile) -> tuple[float, float, float, float
     y1 = shape[0] if y + h >= shape[0] else y + 3 * h / 4
     x1 = shape[1] if x + w >= shape[1] else x + 3 * w / 4
     return (x0, y0, x1, y1)
+
+
+def finest_tile(shape: tuple[int, int], bbox: tuple[float, float, float, float], level: int) -> Tile | None:
+    """The tile containing bbox at the finest level up to `level` that has one; None for the whole image."""
+    for lvl in range(level, 0, -1):
+        tile = tile_for(shape, lvl, bbox)
+        if tile is not None:
+            return tile
+    return None

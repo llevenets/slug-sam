@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 from . import tiles
 from .auto import grid_masks
 from .canvas import Canvas, make_lut
-from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, next_image, save_labels
+from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, next_image, save_labels, save_mask
 from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, load_model, memory_usage
 
 EMBEDDING_CACHE_BYTES = 768 * 2**20  # device memory for cached embeddings: 4 MB (SAM) or 10 MB (SAM 2) per slice
@@ -75,6 +75,7 @@ re-prompts each slice from the previous mask until the overlap drops below <i>Io
 <tr><td><b>Ctrl+Shift+O</b></td><td>open the next image in the folder</td></tr>
 <tr><td><b>Ctrl+W</b></td><td>close the image and free its memory</td></tr>
 <tr><td><b>Ctrl+S</b></td><td>save labels as <i>&lt;image&gt;_labels.tif</i></td></tr>
+<tr><td><b>Ctrl+E</b></td><td>export all objects as a binary mask, <i>mask_&lt;image&gt;.tif</i></td></tr>
 </table>
 """
 
@@ -154,6 +155,10 @@ class MainWindow(QMainWindow):
         a_close = self._action("&Close image", self.close_image, "Ctrl+W")
         a_save = self._action("&Save labels", self.save, QKeySequence.StandardKey.Save)
         a_save_as = self._action("Save labels &as…", self.save_as, "Ctrl+Shift+S")
+        a_export = self._action("&Export binary mask", self.export_mask, "Ctrl+E")
+        a_export.setToolTip("Save all objects as one 0/255 mask, mask_<image>.tif")
+        a_clear_labels = self._action("Clear la&bels", self.clear_labels)
+        a_clear_labels.setToolTip("Remove all objects (Ctrl+Z restores them)")
         a_quit = self._action("&Quit", self.close, "Ctrl+Q")
         self.a_lazy = self._action(
             "&Lazy loading (keep stacks on disk)",
@@ -196,7 +201,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&File")
         m.addActions([a_open, a_next_img, a_close])
         m.addSeparator()
-        m.addActions([a_save, a_save_as])
+        m.addActions([a_save, a_save_as, a_export])
         m.addSeparator()
         m.addAction(self.a_lazy)
         m.addSeparator()
@@ -204,6 +209,7 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Edit")
         m.addActions([a_commit, a_cycle, a_clear, a_undo])
         m.addAction(a_undo_limit)
+        m.addAction(a_clear_labels)
         m.addSeparator()
         m.addAction(a_auto)
         m.addActions(a_prop)
@@ -218,6 +224,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
         tb.addAction(a_open)
         tb.addAction(a_save)
+        tb.addAction(a_clear_labels)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Model "))
@@ -512,8 +519,7 @@ class MainWindow(QMainWindow):
         self._reset_prompts()
         self._refresh_labels()
         self.wanted_tile = self._view_tile()
-        if not (self.prop and "video" in self.prop):  # video tracking embeds frames itself
-            self._ensure_embedding()
+        self._ensure_embedding()
 
     def _channel_chosen(self, i: int):
         if self.stack is None or self.prop:
@@ -568,8 +574,8 @@ class MainWindow(QMainWindow):
         """Ask for the most useful missing embedding: this slice, then a finer tile, then neighbours."""
         if self.model is None or self.stack is None:
             return
-        if self.prop and ("video" in self.prop or "auto" in self.prop):
-            return  # these embed what they need themselves
+        if self.prop:
+            return  # propagation and auto-segmentation embed what they need themselves
         if self._embedding() is None:
             self._request(self._key(), self.rgb)
             self.statusBar().showMessage("Computing image embedding… (you can already place prompts)")
@@ -589,19 +595,27 @@ class MainWindow(QMainWindow):
             # reserved; give it back once there is nothing left to embed.
             free_gpu_cache()
 
-    def _store_embedding(self, key, emb):
+    def _cache(self, key, emb):
         self.embeddings[key] = emb
         while (
             len(self.embeddings) > 2 * PREFETCH_RADIUS + 1
             and sum(e.nbytes for e in self.embeddings.values()) > EMBEDDING_CACHE_BYTES
         ):
             self.embeddings.popitem(last=False)
-        if key[3] != self.idx:
+
+    def _embedding_now(self, tile: tiles.Tile | None = None):
+        """The embedding of the current slice or one of its tiles, computed on the spot if missing."""
+        emb = self._embedding(tile)
+        if emb is None:
+            emb = self.model.embed(self.rgb if tile is None else self._crop(tile))
+            self._cache(self._key(tile=tile), emb)
+        return emb
+
+    def _store_embedding(self, key, emb):
+        self._cache(key, emb)
+        if key[3] != self.idx or self.prop:
             return
-        if self.prop:
-            if key[4] is None and not ("video" in self.prop or "auto" in self.prop):
-                self._propagate_work()
-        elif self._has_prompts():
+        if self._has_prompts():
             self._update_prediction()  # first mask, or the same mask in finer detail
         else:
             if key[4] is None:
@@ -641,18 +655,21 @@ class MainWindow(QMainWindow):
             self.wanted_tile = self._view_tile()
         self._ensure_embedding()
 
-    def _predict(self, points, box=None, choice=None, level: int | None = None):
+    def _predict(self, points, box=None, choice=None, level: int | None = None, wait: bool = False):
         """Decode prompts on the finest embedded tile that holds them all.
 
         Returns (full-frame mask, score, number of candidates, detail factor), or None while
         nothing is embedded yet. If a finer tile than the one used would fit, it is requested
-        and the caller is run again when it arrives.
+        and the caller is run again when it arrives; with wait=True it is computed first.
         """
         shape = self.stack.frame_shape
         level = self._view_level() if level is None else level
         xs = [p[0] for p in points] + ([box[0], box[2]] if box else [])
         ys = [p[1] for p in points] + ([box[1], box[3]] if box else [])
         bbox = (min(xs), min(ys), max(xs), max(ys))
+        if wait:
+            tile = tiles.finest_tile(shape, bbox, level)
+            return self._predict_on(self._embedding_now(tile), tile, points, box, choice)
         emb, tile, wanted = self._embedding(), None, None
         for lvl in range(level, 0, -1):
             t = tiles.tile_for(shape, lvl, bbox)
@@ -668,6 +685,10 @@ class MainWindow(QMainWindow):
             self._ensure_embedding()
         if emb is None:
             return None
+        return self._predict_on(emb, tile, points, box, choice)
+
+    def _predict_on(self, emb, tile, points, box, choice):
+        shape = self.stack.frame_shape
         if tile is None:
             return (*self.model.predict(emb, points, box, choice), 1)
         y, x, h, w = tile
@@ -967,7 +988,7 @@ class MainWindow(QMainWindow):
         if not self.active:
             self.next_id += 1
         self.active = self.last_id = obj
-        static = (list(self.points), self.box, self.choice)
+        static = (list(self.points), self.box, self.choice, self.prompt_level)
         self._reset_prompts()
         self._refresh_labels()
         self.slice_slider.setEnabled(False)
@@ -989,39 +1010,70 @@ class MainWindow(QMainWindow):
         if not p["masks"] or not 0 <= j < len(self.stack):
             self._propagate_finish()
             return
-        self.slice_slider.setValue(j)  # shows the slice and requests its embedding
-        if self._embedding() is not None:
-            QTimer.singleShot(0, self._propagate_work)
-        # otherwise on_embedded() continues
+        self.slice_slider.setValue(j)
+        QTimer.singleShot(0, self._propagate_work)
+
+    def _track_by_overlap(self, prev: np.ndarray):
+        """Re-find an object on the current slice from its mask on the previous one.
+
+        Prompts with a point inside the previous mask and keeps whichever of the model's
+        candidates matches that mask best. No box: it would pin a moving object in place.
+        Works on the finest tile that holds the object with room to move, so the result is as
+        detailed as a mask drawn zoomed in. Returns (full-frame mask, IoU with prev).
+        """
+        shape = self.stack.frame_shape
+        ys, xs = np.flatnonzero(prev.any(1)), np.flatnonzero(prev.any(0))
+        mh, mw = (ys[-1] - ys[0] + 1) / 2, (xs[-1] - xs[0] + 1) / 2  # margin: half its size each way
+        bbox = (
+            max(xs[0] - mw, 0),
+            max(ys[0] - mh, 0),
+            min(xs[-1] + 1 + mw, shape[1]),
+            min(ys[-1] + 1 + mh, shape[0]),
+        )
+        level = tiles.max_level(shape) if self.a_detail.isChecked() else 0
+        y, x, h, w = tile = tiles.finest_tile(shape, bbox, level) or (0, 0, *shape)
+        prev_part = prev[y : y + h, x : x + w]
+        px, py, _ = interior_point(prev_part)
+        emb = self._embedding_now(tile if (h, w) != shape else None)
+        cands = self.model.predict_candidates(emb, [(px, py, True)])
+        ious = [(m & prev_part).sum() / max((m | prev_part).sum(), 1) for m in cands]
+        mask = np.zeros(shape, bool)
+        mask[y : y + h, x : x + w] = cands[int(np.argmax(ious))]
+        return mask, max(ious)
 
     def _propagate_work(self):
-        p, emb = self.prop, self._embedding()
-        if p is None or emb is None:
+        p = self.prop
+        if p is None or "video" in p or "auto" in p:
             return
-        static = p.get("static")
-        if static:
-            (obj,) = p["masks"]
-            self.canvas.set_prompts(static[0], static[1])
-            mask, _, _ = self.model.predict(emb, *static)
-            if self._redraw_object(self.idx, obj, mask, p["group"]) is None:
-                p["masks"].clear()  # empty or fully covered: stop here
-        min_iou = self.min_iou.value()
-        for obj, prev in [] if static else list(p["masks"].items()):
-            # Prompt with a point inside the previous mask and keep whichever of SAM's
-            # candidates matches that mask best. No box: it would pin a moving object in place.
-            cands = self.model.predict_candidates(emb, [interior_point(prev)])
-            ious = [(m & prev).sum() / max((m | prev).sum(), 1) for m in cands]
-            mask, iou = cands[int(np.argmax(ious))], max(ious)
-            region = self._redraw_object(self.idx, obj, mask, p["group"]) if iou >= min_iou else None
-            if region is None:
-                del p["masks"][obj]  # lost
-            else:
-                p["masks"][obj] = region
+        try:
+            self._propagate_slice(p)
+        except Exception as e:  # e.g. CUDA out of memory
+            self._propagate_finish(error=f"{type(e).__name__}: {e}")
+            return
         self._refresh_labels()
         self.statusBar().showMessage(
             f"Propagating {len(p['masks'])}/{p['n']} object(s), slice {self.idx + 1} — Esc to stop"
         )
         QTimer.singleShot(0, self._propagate_advance)
+
+    def _propagate_slice(self, p):
+        static = p.get("static")
+        if static:
+            (obj,) = p["masks"]
+            points, box, choice, level = static
+            self.canvas.set_prompts(points, box)
+            mask = self._predict(points, box, choice, level, wait=True)[0]
+            if self._redraw_object(self.idx, obj, mask, p["group"]) is None:
+                p["masks"].clear()  # empty or fully covered: stop here
+            return
+        min_iou = self.min_iou.value()
+        for obj, prev in list(p["masks"].items()):
+            mask, iou = self._track_by_overlap(prev)
+            region = self._redraw_object(self.idx, obj, mask, p["group"]) if iou >= min_iou else None
+            if region is None:
+                del p["masks"][obj]  # lost
+            else:
+                p["masks"][obj] = region
 
     def _propagate_video(self, direction: int, ids: list[int]):
         """Track objects with SAM 2's video memory, seeded with their masks on this slice."""
@@ -1275,6 +1327,49 @@ class MainWindow(QMainWindow):
         self._update_title()
         self.statusBar().showMessage(f"Saved {path}", 4000)
         return True
+
+    def export_mask(self):
+        if self.stack is None:
+            return
+        path = self.stack.mask_path
+        try:
+            save_mask(path, self.labels)
+        except Exception as e:
+            QMessageBox.warning(self, "SlugSam", f"Could not save {path}:\n{e}")
+            return
+        self.statusBar().showMessage(f"Exported binary mask to {path}", 4000)
+
+    def clear_labels(self):
+        """Remove all objects from this slice or, on request, from the whole stack."""
+        if self.stack is None or self.prop:
+            return
+        slices = [self.idx]
+        if len(self.stack) > 1:
+            box = QMessageBox(QMessageBox.Icon.Question, "Clear labels", "Remove all objects from:", parent=self)
+            this = box.addButton("This slice", QMessageBox.ButtonRole.AcceptRole)
+            every = box.addButton("All slices", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() is every:
+                slices = range(len(self.stack))
+            elif box.clickedButton() is not this:
+                return
+        self._clear_labels(slices)
+
+    def _clear_labels(self, slices):
+        group, next_id = [], self.next_id
+        for j in slices:
+            self._edit_labels(j, self.labels[j] != 0, 0, group)
+        if not group:
+            self.statusBar().showMessage("No objects to remove", 3000)
+            return
+        if len(slices) == len(self.stack):
+            self.next_id = 1  # nothing is left: start numbering afresh
+        self._push_undo(group, next_id)
+        self.active = self.last_id = None
+        self._reset_prompts()
+        self._refresh_labels()
+        self.statusBar().showMessage(f"Removed all objects from {len(group)} slice(s) — Ctrl+Z restores them")
 
     def save_as(self):
         if self.stack is None:

@@ -63,7 +63,7 @@ class Canvas(QGraphicsView):
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.NoAnchor)  # wheelEvent anchors itself
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -163,7 +163,12 @@ class Canvas(QGraphicsView):
         factor = 1.0015**dy
         scale = self.transform().m11() * factor
         if 0.01 < scale < 80:
+            # keep the image point under the cursor where it is
+            pos = ev.position().toPoint()
+            before = self.mapToScene(pos)
             self.scale(factor, factor)
+            moved = self.mapToScene(pos) - before
+            self.translate(moved.x(), moved.y())
             self._update_smoothing()
             self.viewChanged.emit()
 

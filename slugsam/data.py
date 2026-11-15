@@ -27,6 +27,9 @@ def next_image(path: Path) -> Path | None:
         ),
         key=key,
     )
+    names = {f.stem for f in files}
+    # an exported "mask_<image>" is output, not another image to segment
+    files = [f for f in files if not (f.stem.startswith("mask_") and f.stem[5:] in names)]
     later = [f for f in files if key(f) > key(path)]
     return later[0] if later else None
 
@@ -100,6 +103,10 @@ class ImageStack:
     @property
     def labels_path(self) -> Path:
         return self.path.with_name(self.path.stem + "_labels.tif")
+
+    @property
+    def mask_path(self) -> Path:
+        return self.path.with_name("mask_" + self.path.stem + ".tif")
 
 
 def _stretch(ch: np.ndarray, lo_pct=0.5, hi_pct=99.9) -> np.ndarray:
@@ -195,6 +202,12 @@ def load_labels(path: Path, n: int, shape: tuple[int, int]) -> np.ndarray | None
         return None
     lab = lab.reshape((n, *shape))
     return lab.astype(np.uint16 if lab.max(initial=0) < 65536 else np.uint32)
+
+
+def save_mask(path: Path, labels: np.ndarray):
+    """All objects together as one binary mask: 8-bit, 255 inside objects and 0 outside."""
+    out = labels[0] if labels.shape[0] == 1 else labels
+    tifffile.imwrite(path, (out > 0).astype(np.uint8) * 255, compression="zlib")
 
 
 def save_labels(path: Path, labels: np.ndarray):
