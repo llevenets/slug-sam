@@ -13,10 +13,14 @@ IMAGE_FILTER = "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)"
 class ImageStack:
     """An image as N frames of (H, W) or (H, W, C); a plain 2D image has N == 1."""
 
-    def __init__(self, path: Path, data: np.ndarray, note: str = ""):
+    def __init__(self, path: Path, data: np.ndarray, is_rgb: bool = False):
         self.path = path
         self.data = data
-        self.note = note
+        self.is_rgb = is_rgb  # the last axis holds colour samples rather than channels
+
+    @property
+    def channels(self) -> int:
+        return self.data.shape[3] if self.data.ndim == 4 else 1
 
     def __len__(self):
         return self.data.shape[0]
@@ -25,9 +29,14 @@ class ImageStack:
     def frame_shape(self) -> tuple[int, int]:
         return self.data.shape[1:3]
 
-    def frame_rgb(self, i: int) -> np.ndarray:
-        """Frame i as contiguous (H, W, 3) uint8, contrast-stretched unless already uint8."""
+    def frame_rgb(self, i: int, channel: int | None = None) -> np.ndarray:
+        """Frame i as contiguous (H, W, 3) uint8, contrast-stretched unless already uint8.
+
+        channel selects a single channel, shown in grey; None composites the first three.
+        """
         f = self.data[i]
+        if f.ndim == 3 and channel is not None:
+            f = f[..., channel]
         if f.ndim == 2:
             f = f[..., None]
         if f.dtype == bool:
@@ -85,10 +94,7 @@ def _to_stack(path: Path, arr: np.ndarray, axes: str) -> ImageStack:
     arr = np.transpose(arr, order)
     tail = arr.shape[-3:] if ch else arr.shape[-2:]
     arr = arr.reshape((-1, *tail))
-    note = ""
-    if ch and arr.shape[-1] > 3:
-        note = f"{arr.shape[-1]} channels: showing the first 3"
-    return ImageStack(path, arr, note)
+    return ImageStack(path, arr, is_rgb=ch == "S")
 
 
 def load_labels(path: Path, n: int, shape: tuple[int, int]) -> np.ndarray | None:

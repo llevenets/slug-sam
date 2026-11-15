@@ -37,7 +37,7 @@ def _pixmap(arr: np.ndarray, fmt: QImage.Format) -> QPixmap:
 
 class Canvas(QGraphicsView):
     pointClicked = Signal(float, float, bool)  # x, y, positive
-    pickClicked = Signal(float, float)  # ctrl+click
+    modClicked = Signal(float, float, bool, bool)  # x, y, ctrl, shift: click with a modifier held
     boxDrawn = Signal(float, float, float, float)
     hovered = Signal(float, float)  # image coords, or (-1, -1) when off the image
 
@@ -47,6 +47,7 @@ class Canvas(QGraphicsView):
         self.setScene(scene)
         self._img = scene.addPixmap(QPixmap())
         self._lab = scene.addPixmap(QPixmap())
+        self._sel = scene.addPixmap(QPixmap())
         self._prev = scene.addPixmap(QPixmap())
         self._lab.setOpacity(0.45)
         self._shape = (0, 0)
@@ -90,12 +91,20 @@ class Canvas(QGraphicsView):
 
     def set_preview(self, mask: np.ndarray | None, color=(255, 255, 255), fill_alpha=110):
         """Show a candidate mask as a translucent fill with a solid outline."""
+        self._show_mask(self._prev, mask, color, fill_alpha)
+
+    def set_selection(self, mask: np.ndarray | None):
+        """Outline the selected object."""
+        self._show_mask(self._sel, mask, (255, 255, 255), 0)
+
+    @staticmethod
+    def _show_mask(item, mask, color, fill_alpha):
         if mask is None:
-            self._prev.setPixmap(QPixmap())
+            item.setPixmap(QPixmap())
             return
         ys, xs = np.flatnonzero(mask.any(1)), np.flatnonzero(mask.any(0))
         if not len(ys):
-            self._prev.setPixmap(QPixmap())
+            item.setPixmap(QPixmap())
             return
         y0, y1, x0, x1 = ys[0], ys[-1] + 1, xs[0], xs[-1] + 1
         m = np.pad(mask[y0:y1, x0:x1], 1)
@@ -104,8 +113,8 @@ class Canvas(QGraphicsView):
         rgba = np.zeros((*m.shape, 4), np.uint8)
         rgba[m] = (*color, fill_alpha)
         rgba[m & ~inner] = (*color, 255)
-        self._prev.setPixmap(_pixmap(rgba, QImage.Format.Format_RGBA8888))
-        self._prev.setOffset(float(x0), float(y0))
+        item.setPixmap(_pixmap(rgba, QImage.Format.Format_RGBA8888))
+        item.setOffset(float(x0), float(y0))
 
     def set_prompts(self, points, box):
         self.points, self.box = list(points), box
@@ -151,10 +160,12 @@ class Canvas(QGraphicsView):
             self._pan = pos
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
         elif btn == Qt.MouseButton.LeftButton:
-            if ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            ctrl = bool(ev.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            shift = bool(ev.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            if ctrl or shift:
                 p = self._image_pos(pos)
                 if self._inside(p):
-                    self.pickClicked.emit(p.x(), p.y())
+                    self.modClicked.emit(p.x(), p.y(), ctrl, shift)
             else:
                 self._press = pos
         elif btn == Qt.MouseButton.RightButton:

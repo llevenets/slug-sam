@@ -82,15 +82,8 @@ class SamModel:
         features = self.sam.image_encoder(self.sam.preprocess(x))
         return Embedding(features, rgb.shape[:2], input_size)
 
-    @torch.inference_mode()
-    def predict(self, emb: Embedding, points=(), box=None, choice: int | None = None):
-        """Decode a mask from prompts.
-
-        points: sequence of (x, y, is_positive); box: (x0, y0, x1, y1) or None.
-        choice: None picks automatically; an int forces multi-mask output and
-        selects the choice-th candidate, ranked by predicted quality.
-        Returns (mask (H, W) bool, score, number of candidates).
-        """
+    def _decode(self, emb: Embedding, points, box, multimask: bool):
+        """Low-res mask logits (1, k, 256, 256) and predicted quality (k,) for the prompts."""
         sam, dev = self.sam, self.device
         pts = None
         if points:
@@ -105,8 +98,6 @@ class SamModel:
         if box is not None:
             b = self.transform.apply_boxes(np.array([box], dtype=np.float32), emb.original_size)
             bx = torch.as_tensor(b, dtype=torch.float, device=dev)
-        # a single click is ambiguous (part / object / group): let SAM propose three
-        multimask = choice is not None or (box is None and len(points) == 1)
         sparse, dense = sam.prompt_encoder(points=pts, boxes=bx, masks=None)
         low_res, iou = sam.mask_decoder(
             image_embeddings=emb.features,
@@ -115,11 +106,31 @@ class SamModel:
             dense_prompt_embeddings=dense,
             multimask_output=multimask,
         )
-        iou = iou[0]
+        return low_res, iou[0]
+
+    @torch.inference_mode()
+    def predict(self, emb: Embedding, points=(), box=None, choice: int | None = None):
+        """Decode a mask from prompts.
+
+        points: sequence of (x, y, is_positive); box: (x0, y0, x1, y1) or None.
+        choice: None picks automatically; an int forces multi-mask output and
+        selects the choice-th candidate, ranked by predicted quality.
+        Returns (mask (H, W) bool, score, number of candidates).
+        """
+        # a single click is ambiguous (part / object / group): let SAM propose three
+        multimask = choice is not None or (box is None and len(points) == 1)
+        low_res, iou = self._decode(emb, points, box, multimask)
         order = torch.argsort(iou, descending=True)
         k = int(order[(choice or 0) % len(order)])
-        mask = sam.postprocess_masks(low_res[:, k : k + 1], emb.input_size, emb.original_size)
+        mask = self.sam.postprocess_masks(low_res[:, k : k + 1], emb.input_size, emb.original_size)
         return (mask[0, 0] > 0).cpu().numpy(), float(iou[k]), len(order)
+
+    @torch.inference_mode()
+    def predict_candidates(self, emb: Embedding, points=(), box=None) -> np.ndarray:
+        """All three candidate masks for the prompts, as (3, H, W) bool."""
+        low_res, _ = self._decode(emb, points, box, True)
+        masks = self.sam.postprocess_masks(low_res, emb.input_size, emb.original_size)
+        return (masks[0] > 0).cpu().numpy()
 
 
 class EmbedWorker(QThread):

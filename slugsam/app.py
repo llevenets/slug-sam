@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QLabel,
     QMainWindow,
@@ -28,6 +29,14 @@ from .engine import EmbedWorker, SamModel, find_models
 
 MAX_CACHED_EMBEDDINGS = 128  # ~4 MB each, kept on the model device
 PREFETCH_RADIUS = 3  # neighbouring slices embedded ahead of time
+DEFAULT_MIN_IOU = 0.3  # a tracked object is lost when it overlaps its previous slice less
+
+
+def interior_point(mask: np.ndarray) -> tuple[float, float, bool]:
+    """A positive point prompt on the mask pixel nearest its centroid."""
+    ys, xs = np.nonzero(mask)
+    k = np.argmin((ys - ys.mean()) ** 2 + (xs - xs.mean()) ** 2)
+    return (xs[k] + 0.5, ys[k] + 0.5, True)
 
 HELP = """
 <table cellspacing=6>
@@ -36,9 +45,15 @@ HELP = """
 <tr><td><b>Left drag</b></td><td>draw a box prompt</td></tr>
 <tr><td><b>Enter</b></td><td>commit the current mask as a new object</td></tr>
 <tr><td><b>Tab</b></td><td>cycle through SAM's alternative masks</td></tr>
-<tr><td><b>Esc</b></td><td>clear prompts</td></tr>
+<tr><td><b>Esc</b></td><td>stop propagation, else clear prompts, else deselect</td></tr>
 <tr><td><b>Ctrl+Z</b></td><td>undo last prompt, or last object edit</td></tr>
-<tr><td><b>Ctrl+click</b></td><td>delete the object under the cursor</td></tr>
+<tr><td><b>Ctrl+click</b></td><td>delete the object under the cursor (<b>+Shift</b>: on all slices)</td></tr>
+<tr><td><b>Shift+click</b></td><td>select an object: Enter then redraws it, on any slice, keeping its id</td></tr>
+<tr><td><b>P / Shift+P</b></td><td>with prompts placed: apply the same prompts on this and all
+following / previous slices.<br>Otherwise: track the selected (or hovered, or last) object
+through following / previous slices, until its overlap with the previous slice drops below
+<i>Track IoU</i></td></tr>
+<tr><td><b>Ctrl+P / Ctrl+Shift+P</b></td><td>track all objects on this slice forward / backward</td></tr>
 <tr><td><b>Wheel</b></td><td>zoom</td></tr>
 <tr><td><b>Middle drag / Space+drag</b></td><td>pan</td></tr>
 <tr><td><b>R</b></td><td>fit image to window</td></tr>
@@ -59,6 +74,10 @@ class MainWindow(QMainWindow):
         self.stack: ImageStack | None = None
         self.stack_id = 0
         self.idx = 0
+        self.channel: int | None = None  # None: composite of the first three channels
+        self.active: int | None = None  # selected object id; commits redraw it instead of adding
+        self.last_id: int | None = None
+        self.prop: dict | None = None  # state of a running propagation
         self.rgb: np.ndarray | None = None
         self.labels: np.ndarray | None = None
         self.next_id = 1
@@ -77,7 +96,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.canvas)
         self.canvas.pointClicked.connect(self.add_point)
         self.canvas.boxDrawn.connect(self.set_box)
-        self.canvas.pickClicked.connect(self.delete_object_at)
+        self.canvas.modClicked.connect(self.on_mod_click)
         self.canvas.hovered.connect(self.on_hover)
 
         self.worker = EmbedWorker(self)
@@ -119,6 +138,12 @@ class MainWindow(QMainWindow):
         a_cycle = self._action("Next &alternative mask", self.cycle_mask, Qt.Key.Key_Tab)
         a_clear = self._action("C&lear prompts", self.clear_prompts, Qt.Key.Key_Escape)
         a_undo = self._action("&Undo", self.undo, QKeySequence.StandardKey.Undo)
+        a_prop = [
+            self._action("Propagate object &forward", lambda: self.propagate(1), "P"),
+            self._action("Propagate object &backward", lambda: self.propagate(-1), "Shift+P"),
+            self._action("Propagate all objects forward", lambda: self.propagate(1, True), "Ctrl+P"),
+            self._action("Propagate all objects backward", lambda: self.propagate(-1, True), "Ctrl+Shift+P"),
+        ]
         a_fit = self._action("&Fit to window", self.canvas.fit, "R")
         self.a_show = self._action(
             "Show &objects", self.canvas.set_labels_visible, "V", checkable=True, checked=True
@@ -138,6 +163,8 @@ class MainWindow(QMainWindow):
         m.addAction(a_quit)
         m = mb.addMenu("&Edit")
         m.addActions([a_commit, a_cycle, a_clear, a_undo])
+        m.addSeparator()
+        m.addActions(a_prop)
         m = mb.addMenu("&View")
         m.addActions([a_fit, self.a_show, self.a_hover])
         m.addSeparator()
@@ -161,6 +188,13 @@ class MainWindow(QMainWindow):
         self.model_combo.setCurrentIndex(-1)
         self.model_combo.activated.connect(self._model_chosen)
         tb.addWidget(self.model_combo)
+        self.channel_combo = QComboBox()
+        self.channel_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.channel_combo.setToolTip("Channel shown and used for segmentation")
+        self.channel_combo.activated.connect(self._channel_chosen)
+        self.channel_actions = [tb.addWidget(QLabel(" Channel ")), tb.addWidget(self.channel_combo)]
+        for a in self.channel_actions:
+            a.setVisible(False)
         tb.addSeparator()
 
         tb.addWidget(QLabel(" Opacity "))
@@ -187,6 +221,18 @@ class MainWindow(QMainWindow):
         self.slice_actions.append(tb.addWidget(self.slice_slider))
         self.slice_label = QLabel()
         self.slice_actions.append(tb.addWidget(self.slice_label))
+        self.slice_actions.append(tb.addWidget(QLabel(" Track IoU ≥ ")))
+        self.min_iou = QDoubleSpinBox()
+        self.min_iou.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.min_iou.setRange(0.0, 0.95)
+        self.min_iou.setSingleStep(0.05)
+        self.min_iou.setValue(self.settings.value("min_iou", DEFAULT_MIN_IOU, type=float))
+        self.min_iou.setToolTip(
+            "Tracking (P) drops an object when its mask overlaps the previous slice's mask\n"
+            "less than this (intersection over union). 0 keeps following whatever is found."
+        )
+        self.min_iou.valueChanged.connect(lambda v: self.settings.setValue("min_iou", v))
+        self.slice_actions.append(tb.addWidget(self.min_iou))
         for a in self.slice_actions:
             a.setVisible(False)
 
@@ -199,6 +245,8 @@ class MainWindow(QMainWindow):
         parts = []
         if self.labels is not None:
             parts.append(f"{len(np.unique(self.labels[self.idx])) - (0 in self.labels[self.idx])} objects")
+        if self.active:
+            parts.insert(0, f"editing object {self.active} (Esc to deselect)")
         if self.model:
             parts.append(f"{self.model.path.name} ({self.model.model_type}, {self.model.device})")
         self.info.setText("  |  ".join(parts))
@@ -302,6 +350,18 @@ class MainWindow(QMainWindow):
         self.next_id = int(self.labels.max()) + 1
         self.label_undo.clear()
         self.dirty = False
+        self.active = self.last_id = self.prop = None
+        c = stack.channels
+        self.channel_combo.clear()
+        if c > 1:
+            self.channel_combo.addItems([f"{k + 1}" for k in range(c)] + ["Composite"])
+            last = self.settings.value("channel", 0, type=int)
+            self.channel = None if stack.is_rgb else min(last, c - 1)
+            self.channel_combo.setCurrentIndex(c if self.channel is None else self.channel)
+        else:
+            self.channel = None
+        for a in self.channel_actions:
+            a.setVisible(c > 1)
         for a in self.slice_actions:
             a.setVisible(n > 1)
         self.slice_slider.blockSignals(True)
@@ -312,8 +372,8 @@ class MainWindow(QMainWindow):
         msg = [f"{path.name}: {shape[1]}×{shape[0]}" + (f", {n} slices" if n > 1 else "")]
         if existing is not None:
             msg.append(f"loaded existing {stack.labels_path.name}")
-        if stack.note:
-            msg.append(stack.note)
+        if c > 1 and not stack.is_rgb:
+            msg.append(f"{c} channels, using channel {self.channel + 1}")
         self.statusBar().showMessage(" — ".join(msg), 6000)
 
     def set_slice(self, i: int):
@@ -321,14 +381,24 @@ class MainWindow(QMainWindow):
             return
         self.idx = i
         self.slice_label.setText(f" {i + 1}/{len(self.stack)} ")
-        self.rgb = self.stack.frame_rgb(i)
+        self.rgb = self.stack.frame_rgb(i, self.channel)
         self.canvas.set_image(self.rgb)
         self._reset_prompts()
         self._refresh_labels()
         self._ensure_embedding()
 
+    def _channel_chosen(self, i: int):
+        if self.stack is None or self.prop:
+            return
+        self.channel = None if i >= self.stack.channels else i
+        if self.channel is not None:
+            self.settings.setValue("channel", self.channel)
+        self.embeddings.clear()
+        self.pending_key = None
+        self.set_slice(self.idx)
+
     def step_slice(self, d: int):
-        if self.stack is not None and len(self.stack) > 1:
+        if self.stack is not None and len(self.stack) > 1 and not self.prop:
             self.slice_slider.setValue(self.slice_slider.value() + d)
 
     def dragEnterEvent(self, ev):
@@ -343,7 +413,7 @@ class MainWindow(QMainWindow):
     # ---- embeddings ----------------------------------------------------
 
     def _key(self, idx: int | None = None):
-        return (id(self.model), self.stack_id, self.idx if idx is None else idx)
+        return (id(self.model), self.stack_id, self.channel, self.idx if idx is None else idx)
 
     def _embedding(self):
         if self.model is None or self.stack is None:
@@ -368,14 +438,17 @@ class MainWindow(QMainWindow):
     def on_embedded(self, key, emb):
         if key == self.pending_key:
             self.pending_key = None
-        if key[:2] != self._key()[:2]:
-            return  # model or image changed meanwhile
+        if key[:3] != self._key()[:3]:
+            return  # model, image or channel changed meanwhile
         self.embeddings[key] = emb
         while len(self.embeddings) > MAX_CACHED_EMBEDDINGS:
             self.embeddings.popitem(last=False)
         if key == self._key():
-            self.statusBar().showMessage("Ready", 2000)
-            self._update_prediction()
+            if self.prop:
+                self._propagate_work()
+            else:
+                self.statusBar().showMessage("Ready", 2000)
+                self._update_prediction()
             self._prefetch()
         elif self._embedding() is None:
             self._ensure_embedding()  # a prefetch finished while the current slice still waits
@@ -395,7 +468,8 @@ class MainWindow(QMainWindow):
             for j in (self.idx + d, self.idx - d):
                 if 0 <= j < len(self.stack) and self._key(j) not in self.embeddings:
                     self.pending_key = self._key(j)
-                    self.worker.request(self.pending_key, self.model, self.stack.frame_rgb(j))
+                    rgb = self.stack.frame_rgb(j, self.channel)
+                    self.worker.request(self.pending_key, self.model, rgb)
                     return
 
     # ---- prompts -------------------------------------------------------
@@ -407,14 +481,14 @@ class MainWindow(QMainWindow):
         self.prompt_undo.append((list(self.points), self.box, self.choice))
 
     def add_point(self, x: float, y: float, positive: bool):
-        if self.stack is None:
+        if self.stack is None or self.prop:
             return
         self._snapshot()
         self.points.append((x, y, positive))
         self._update_prediction()
 
     def set_box(self, x0, y0, x1, y1):
-        if self.stack is None:
+        if self.stack is None or self.prop:
             return
         self._snapshot()
         self.box = (x0, y0, x1, y1)
@@ -428,6 +502,14 @@ class MainWindow(QMainWindow):
         self._update_prediction()
 
     def clear_prompts(self):
+        """Esc: stop a running propagation, else clear prompts, else deselect."""
+        if self.prop:
+            self._propagate_finish(stopped=True)
+            return
+        if not self._has_prompts() and self.active:
+            self.active = None
+            self._refresh_selection()
+            self._update_title()
         self._reset_prompts()
         self.statusBar().clearMessage()
 
@@ -438,7 +520,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_preview(None)
 
     def _color(self):
-        return tuple(int(c) for c in self.lut[self.next_id & 0xFFFF][:3])
+        return tuple(int(c) for c in self.lut[(self.active or self.next_id) & 0xFFFF][:3])
 
     def _update_prediction(self):
         self.canvas.set_prompts(self.points, self.box)
@@ -452,8 +534,9 @@ class MainWindow(QMainWindow):
         self.mask, score, n = self.model.predict(emb, self.points, self.box, self.choice)
         self.canvas.set_preview(self.mask, self._color(), 110)
         alt = f"alternative {(self.choice or 0) + 1}/{n}, " if n > 1 else ""
+        prop = ", P to apply these prompts on following slices" if len(self.stack) > 1 else ""
         self.statusBar().showMessage(
-            f"Mask: {alt}score {score:.2f} — Enter to commit, Tab for alternatives, Esc to clear"
+            f"Mask: {alt}score {score:.2f} — Enter to commit{prop}, Tab for alternatives, Esc to clear"
         )
 
     def on_hover(self, x: float, y: float):
@@ -462,7 +545,7 @@ class MainWindow(QMainWindow):
             self._hover_timer.start()
 
     def _do_hover(self):
-        if self._has_prompts() or not self.a_hover.isChecked():
+        if self._has_prompts() or self.prop or not self.a_hover.isChecked():
             return
         emb = self._embedding()
         if emb is None:
@@ -478,57 +561,228 @@ class MainWindow(QMainWindow):
 
     def _refresh_labels(self):
         self.canvas.set_labels(self.lut[self.labels[self.idx] & 0xFFFF])
+        self._refresh_selection()
         self._update_title()
 
-    def _edit_labels(self, region: np.ndarray, value: int):
-        """Write value into labels[idx][region], recording a patch for undo."""
+    def _refresh_selection(self):
+        mask = self.labels[self.idx] == self.active if self.active else None
+        self.canvas.set_selection(mask)
+
+    def _edit_labels(self, idx: int, region: np.ndarray, value: int, group: list):
+        """Write value into labels[idx][region], appending an undo patch to group."""
         ys, xs = np.flatnonzero(region.any(1)), np.flatnonzero(region.any(0))
+        if not len(ys):
+            return
         sl = (slice(ys[0], ys[-1] + 1), slice(xs[0], xs[-1] + 1))
-        lab = self.labels[self.idx]
-        self.label_undo.append((self.idx, sl, lab[sl].copy(), self.next_id))
+        lab = self.labels[idx]
+        group.append((idx, sl, lab[sl].copy()))
         lab[sl][region[sl]] = value
         self.dirty = True
 
-    def commit(self):
-        if self.mask is None:
-            return
-        region = self.mask & (self.labels[self.idx] == 0)  # never overwrite existing objects
+    def _redraw_object(self, idx: int, obj: int, mask: np.ndarray, group: list) -> np.ndarray | None:
+        """Make mask the shape of obj on slice idx, without overwriting other objects."""
+        lab = self.labels[idx]
+        region = mask & ((lab == 0) | (lab == obj))
         if not region.any():
+            return None
+        self._edit_labels(idx, lab == obj, 0, group)
+        self._edit_labels(idx, region, obj, group)
+        return region
+
+    def _target_id(self) -> int:
+        """Id the current mask will be written as: the selected object, or a new one."""
+        obj = self.active or self.next_id
+        if obj > np.iinfo(self.labels.dtype).max:
+            self.labels = self.labels.astype(np.uint32)
+        return obj
+
+    def _push_undo(self, group: list, next_id: int):
+        if group:
+            self.label_undo.append((group, next_id))
+
+    def commit(self):
+        if self.mask is None or self.prop:
+            return
+        obj = self._target_id()
+        group = []
+        if self._redraw_object(self.idx, obj, self.mask, group) is None:
             self.statusBar().showMessage("Nothing to add: the mask is empty or fully covered", 4000)
             return
-        if self.next_id > np.iinfo(self.labels.dtype).max:
-            self.labels = self.labels.astype(np.uint32)
-        self._edit_labels(region, self.next_id)
-        self.statusBar().showMessage(f"Added object {self.next_id}", 2000)
-        self.next_id += 1
+        self._push_undo(group, self.next_id)
+        if self.active:
+            self.statusBar().showMessage(f"Redrew object {obj} on this slice", 2000)
+        else:
+            self.statusBar().showMessage(f"Added object {obj}", 2000)
+            self.next_id += 1
+        self.last_id = obj
         self._reset_prompts()
         self._refresh_labels()
 
-    def delete_object_at(self, x: float, y: float):
-        if self.labels is None:
+    def on_mod_click(self, x: float, y: float, ctrl: bool, shift: bool):
+        if self.labels is None or self.prop:
             return
         obj = int(self.labels[self.idx][int(y), int(x)])
-        if not obj:
-            return
-        self._edit_labels(self.labels[self.idx] == obj, 0)
-        self.statusBar().showMessage(f"Deleted object {obj} (Ctrl+Z to restore)", 3000)
+        if ctrl:
+            if obj:
+                self.delete_object(obj, all_slices=shift)
+        else:
+            self.active = obj or None
+            self._reset_prompts()
+            self._refresh_selection()
+            self._update_title()
+            if obj:
+                self.statusBar().showMessage(
+                    f"Object {obj} selected: Enter redraws it here, P propagates it", 5000
+                )
+
+    def delete_object(self, obj: int, all_slices: bool = False):
+        group = []
+        for j in range(len(self.stack)) if all_slices else [self.idx]:
+            self._edit_labels(j, self.labels[j] == obj, 0, group)
+        self._push_undo(group, self.next_id)
+        where = f"on {len(group)} slices" if all_slices else "on this slice"
+        self.statusBar().showMessage(f"Deleted object {obj} {where} (Ctrl+Z to restore)", 3000)
         self._refresh_labels()
 
     def undo(self):
+        if self.prop:
+            return
         if self.prompt_undo:
             self.points, self.box, self.choice = self.prompt_undo.pop()
             self._update_prediction()
             if not self._has_prompts():
                 self.statusBar().clearMessage()
         elif self.label_undo:
-            idx, sl, patch, next_id = self.label_undo.pop()
-            self.labels[idx][sl] = patch
+            group, next_id = self.label_undo.pop()
+            for idx, sl, patch in reversed(group):
+                self.labels[idx][sl] = patch
             self.next_id = next_id
             self.dirty = True
-            if idx != self.idx and len(self.stack) > 1:
-                self.slice_slider.setValue(idx)
+            touched = {g[0] for g in group}
+            if self.idx not in touched:
+                self.slice_slider.setValue(group[0][0])
             else:
                 self._refresh_labels()
+            self.statusBar().showMessage(f"Undid edit on {len(touched)} slice(s)", 2000)
+
+    # ---- propagation across slices --------------------------------------
+
+    def propagate(self, direction: int, all_objects: bool = False):
+        """Follow objects from this slice through the stack, re-prompting SAM from each previous mask."""
+        # Objects must overlap themselves between consecutive slices to be followed.
+        if self.stack is None or self.model is None or self.prop or len(self.stack) == 1:
+            return
+        lab = self.labels[self.idx]
+        if self._has_prompts() and not all_objects:
+            self._propagate_static(direction)
+            return
+        if all_objects:
+            ids = [int(i) for i in np.unique(lab) if i]
+        else:
+            obj = self.active
+            if not obj and self._hover_pos and self._hover_pos[0] >= 0:
+                obj = int(lab[int(self._hover_pos[1]), int(self._hover_pos[0])])
+            obj = obj or self.last_id
+            ids = [obj] if obj and (lab == obj).any() else []
+            if ids:
+                self.active = obj  # stays selected so it can be fixed where tracking stops
+        if not ids:
+            self.statusBar().showMessage(
+                "Nothing to propagate: select (Shift+click) or hover an object on this slice", 5000
+            )
+            return
+        self._reset_prompts()
+        self.slice_slider.setEnabled(False)
+        self.prop = {
+            "dir": direction,
+            "masks": {i: lab == i for i in ids},
+            "n": len(ids),
+            "group": [],
+            "next_id": self.next_id,
+        }
+        self._propagate_advance()
+
+    def _propagate_static(self, direction: int):
+        """Apply the current prompts unchanged on this and every following slice, as one object."""
+        if self.mask is None:
+            return  # embedding not ready yet
+        obj, group, next_id = self._target_id(), [], self.next_id
+        if self._redraw_object(self.idx, obj, self.mask, group) is None:
+            self.statusBar().showMessage("Nothing to add: the mask is empty or fully covered", 4000)
+            return
+        if not self.active:
+            self.next_id += 1
+        self.active = self.last_id = obj
+        static = (list(self.points), self.box, self.choice)
+        self._reset_prompts()
+        self._refresh_labels()
+        self.slice_slider.setEnabled(False)
+        self.prop = {
+            "dir": direction,
+            "masks": {obj: None},
+            "n": 1,
+            "group": group,
+            "next_id": next_id,
+            "static": static,
+        }
+        self._propagate_advance()
+
+    def _propagate_advance(self):
+        p = self.prop
+        if p is None:
+            return
+        j = self.idx + p["dir"]
+        if not p["masks"] or not 0 <= j < len(self.stack):
+            self._propagate_finish()
+            return
+        self.slice_slider.setValue(j)  # shows the slice and requests its embedding
+        if self._embedding() is not None:
+            QTimer.singleShot(0, self._propagate_work)
+        # otherwise on_embedded() continues
+
+    def _propagate_work(self):
+        p, emb = self.prop, self._embedding()
+        if p is None or emb is None:
+            return
+        static = p.get("static")
+        if static:
+            (obj,) = p["masks"]
+            self.canvas.set_prompts(static[0], static[1])
+            mask, _, _ = self.model.predict(emb, *static)
+            if self._redraw_object(self.idx, obj, mask, p["group"]) is None:
+                p["masks"].clear()  # empty or fully covered: stop here
+        min_iou = self.min_iou.value()
+        for obj, prev in [] if static else list(p["masks"].items()):
+            # Prompt with a point inside the previous mask and keep whichever of SAM's
+            # candidates matches that mask best. No box: it would pin a moving object in place.
+            cands = self.model.predict_candidates(emb, [interior_point(prev)])
+            ious = [(m & prev).sum() / max((m | prev).sum(), 1) for m in cands]
+            mask, iou = cands[int(np.argmax(ious))], max(ious)
+            region = self._redraw_object(self.idx, obj, mask, p["group"]) if iou >= min_iou else None
+            if region is None:
+                del p["masks"][obj]  # lost
+            else:
+                p["masks"][obj] = region
+        self._refresh_labels()
+        self.statusBar().showMessage(
+            f"Propagating {len(p['masks'])}/{p['n']} object(s), slice {self.idx + 1} — Esc to stop"
+        )
+        QTimer.singleShot(0, self._propagate_advance)
+
+    def _propagate_finish(self, stopped: bool = False):
+        p, self.prop = self.prop, None
+        self.slice_slider.setEnabled(True)
+        self.canvas.set_prompts([], None)
+        self._push_undo(p["group"], p["next_id"])
+        n = len({g[0] for g in p["group"]})
+        lost = p["n"] - len(p["masks"])
+        msg = f"Propagated {p['n']} object(s) onto {n} slice(s)"
+        if stopped:
+            msg += ", stopped"
+        elif lost:
+            msg += f"; {lost} lost on the way" if p["n"] > 1 else f"; lost at slice {self.idx + 1}"
+        self._ensure_embedding()
+        self.statusBar().showMessage(msg + " — Ctrl+Z undoes it")
 
     # ---- saving --------------------------------------------------------
 
