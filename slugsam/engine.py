@@ -44,6 +44,29 @@ def find_models() -> list[Path]:
     return found
 
 
+def free_gpu_cache():
+    """Return memory PyTorch holds but no longer uses (e.g. encoder scratch space) to the GPU."""
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def memory_usage() -> dict:
+    """Current memory figures in bytes; keys are absent where a figure is unavailable."""
+    out = {}
+    try:
+        with open("/proc/self/statm") as f:
+            out["ram"] = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except OSError:
+        pass
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        out["gpu_used"] = total - free  # whole device, other programs included
+        out["gpu_total"] = total
+        out["gpu_ours"] = torch.cuda.memory_reserved()
+        out["gpu_live"] = torch.cuda.memory_allocated()
+    return out
+
+
 @dataclass
 class Embedding:
     features: torch.Tensor  # (1, 256, 64, 64) on the model device

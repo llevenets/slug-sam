@@ -80,6 +80,12 @@ class Canvas(QGraphicsView):
             self.setSceneRect(QRectF(-w / 2, -h / 2, 2 * w, 2 * h))  # room to pan past edges
             self.fit()
 
+    def clear(self):
+        for item in (self._img, self._lab, self._sel, self._prev):
+            item.setPixmap(QPixmap())
+        self._shape = (0, 0)
+        self.set_prompts([], None)
+
     def set_labels(self, rgba: np.ndarray):
         self._lab.setPixmap(_pixmap(rgba, QImage.Format.Format_RGBA8888))
 

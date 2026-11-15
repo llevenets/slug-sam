@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -24,11 +25,12 @@ from PySide6.QtWidgets import (
 )
 
 from .canvas import Canvas, make_lut
-from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, save_labels
-from .engine import EmbedWorker, SamModel, find_models
+from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, next_image, save_labels
+from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, memory_usage
 
 MAX_CACHED_EMBEDDINGS = 128  # ~4 MB each, kept on the model device
 PREFETCH_RADIUS = 3  # neighbouring slices embedded ahead of time
+DEFAULT_UNDO_LIMIT = 50  # object edits kept for undo; 0 means unlimited
 DEFAULT_MIN_IOU = 0.3  # a tracked object is lost when it overlaps its previous slice less
 
 
@@ -60,6 +62,8 @@ through following / previous slices, until its overlap with the previous slice d
 <tr><td><b>V</b></td><td>show / hide objects</td></tr>
 <tr><td><b>H</b></td><td>toggle hover preview</td></tr>
 <tr><td><b>, / .</b> or <b>← / →</b></td><td>previous / next slice</td></tr>
+<tr><td><b>Ctrl+Shift+O</b></td><td>open the next image in the folder</td></tr>
+<tr><td><b>Ctrl+W</b></td><td>close the image and free its memory</td></tr>
 <tr><td><b>Ctrl+S</b></td><td>save labels as <i>&lt;image&gt;_labels.tif</i></td></tr>
 </table>
 """
@@ -131,9 +135,19 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self):
         a_open = self._action("&Open image…", self.open_dialog, QKeySequence.StandardKey.Open)
+        a_next_img = self._action("Open &next image in folder", self.open_next, "Ctrl+Shift+O")
+        a_close = self._action("&Close image", self.close_image, "Ctrl+W")
         a_save = self._action("&Save labels", self.save, QKeySequence.StandardKey.Save)
         a_save_as = self._action("Save labels &as…", self.save_as, "Ctrl+Shift+S")
         a_quit = self._action("&Quit", self.close, "Ctrl+Q")
+        self.a_lazy = self._action(
+            "&Lazy loading (keep stacks on disk)",
+            lambda on: self.settings.setValue("lazy", on),
+            checkable=True,
+            checked=self.settings.value("lazy", False, type=bool),
+        )
+        self.a_lazy.setToolTip("Applies to the next image opened")
+        a_undo_limit = self._action("Undo history &limit…", self.ask_undo_limit)
         a_commit = self._action("&Commit object", self.commit, Qt.Key.Key_Return, Qt.Key.Key_Enter)
         a_cycle = self._action("Next &alternative mask", self.cycle_mask, Qt.Key.Key_Tab)
         a_clear = self._action("C&lear prompts", self.clear_prompts, Qt.Key.Key_Escape)
@@ -158,11 +172,16 @@ class MainWindow(QMainWindow):
 
         mb = self.menuBar()
         m = mb.addMenu("&File")
-        m.addActions([a_open, a_save, a_save_as])
+        m.addActions([a_open, a_next_img, a_close])
+        m.addSeparator()
+        m.addActions([a_save, a_save_as])
+        m.addSeparator()
+        m.addAction(self.a_lazy)
         m.addSeparator()
         m.addAction(a_quit)
         m = mb.addMenu("&Edit")
         m.addActions([a_commit, a_cycle, a_clear, a_undo])
+        m.addAction(a_undo_limit)
         m.addSeparator()
         m.addActions(a_prop)
         m = mb.addMenu("&View")
@@ -238,6 +257,28 @@ class MainWindow(QMainWindow):
 
         self.info = QLabel()
         self.statusBar().addPermanentWidget(self.info)
+        self.mem = QLabel()
+        self.statusBar().addPermanentWidget(self.mem)
+        self._mem_timer = QTimer(self, interval=2000)
+        self._mem_timer.timeout.connect(self._update_memory)
+        self._mem_timer.start()
+        self._update_memory()
+
+    def _update_memory(self):
+        m, gb = memory_usage(), 2**30
+        parts, tip = [], []
+        if "gpu_total" in m:
+            parts.append(f"GPU {m['gpu_used'] / gb:.1f}/{m['gpu_total'] / gb:.1f} GB")
+            tip.append(
+                f"GPU memory in use on the whole device: {m['gpu_used'] / gb:.2f} GB\n"
+                f"  held by SlugSam: {m['gpu_ours'] / gb:.2f} GB, of which live "
+                f"(model + {len(self.embeddings)} cached embeddings): {m['gpu_live'] / gb:.2f} GB"
+            )
+        if "ram" in m:
+            parts.append(f"RAM {m['ram'] / gb:.1f} GB")
+            tip.append(f"Main memory used by SlugSam: {m['ram'] / gb:.2f} GB")
+        self.mem.setText("  " + " · ".join(parts) + " ")
+        self.mem.setToolTip("\n".join(tip))
 
     def _update_title(self):
         name = f"{self.stack.path.name}{'*' if self.dirty else ''} — " if self.stack else ""
@@ -293,6 +334,7 @@ class MainWindow(QMainWindow):
         self.model = model
         self.embeddings.clear()
         self.pending_key = None
+        free_gpu_cache()  # hand the previous model's memory back
         if self.model_combo.findData(str(path)) < 0:
             self.model_combo.insertItem(self.model_combo.count() - 1, path.name, str(path))
         self._sync_model_combo()
@@ -330,24 +372,64 @@ class MainWindow(QMainWindow):
         if path:
             self.open_image(path)
 
+    def open_next(self):
+        if self.stack is None:
+            self.open_dialog()
+            return
+        nxt = next_image(self.stack.path)
+        if nxt is None:
+            self.statusBar().showMessage(f"{self.stack.path.name} is the last image in its folder", 4000)
+        else:
+            self.open_image(nxt)
+
+    def close_image(self):
+        if self.stack is None:
+            return
+        if self.prop:
+            self._propagate_finish(stopped=True)
+        if not self._confirm_discard():
+            return
+        self._reset_prompts()
+        self.stack.close()
+        self.stack = self.labels = self.rgb = None
+        self.stack_id += 1  # embeddings still being computed for it are dropped on arrival
+        self.embeddings.clear()
+        self.pending_key = None
+        self.label_undo.clear()
+        self.active = self.last_id = None
+        self.dirty = False
+        self.canvas.clear()
+        for a in self.slice_actions + self.channel_actions:
+            a.setVisible(False)
+        free_gpu_cache()
+        self._update_title()
+        self._update_memory()
+        self.statusBar().showMessage("Image closed")
+
     def open_image(self, path: str | Path):
+        if self.prop:
+            self._propagate_finish(stopped=True)
         if not self._confirm_discard():
             return
         path = Path(path)
         try:
-            stack = load_image(path)
+            stack = load_image(path, lazy=self.a_lazy.isChecked())
         except Exception as e:
             QMessageBox.warning(self, "SlugSam", f"Could not open {path.name}:\n{e}")
             return
         self.settings.setValue("image_dir", str(path.parent))
+        if self.stack is not None:
+            self.stack.close()
         self.stack = stack
         self.stack_id += 1
         self.embeddings.clear()
         self.pending_key = None
+        free_gpu_cache()
         n, shape = len(stack), stack.frame_shape
         existing = load_labels(stack.labels_path, n, shape)
+        # A fresh label array is left untouched: the OS only backs the slices that get edited.
         self.labels = existing if existing is not None else np.zeros((n, *shape), np.uint16)
-        self.next_id = int(self.labels.max()) + 1
+        self.next_id = int(existing.max()) + 1 if existing is not None else 1
         self.label_undo.clear()
         self.dirty = False
         self.active = self.last_id = self.prop = None
@@ -374,6 +456,8 @@ class MainWindow(QMainWindow):
             msg.append(f"loaded existing {stack.labels_path.name}")
         if c > 1 and not stack.is_rgb:
             msg.append(f"{c} channels, using channel {self.channel + 1}")
+        if stack.mode != "in memory":
+            msg.append(stack.mode)
         self.statusBar().showMessage(" — ".join(msg), 6000)
 
     def set_slice(self, i: int):
@@ -395,6 +479,7 @@ class MainWindow(QMainWindow):
             self.settings.setValue("channel", self.channel)
         self.embeddings.clear()
         self.pending_key = None
+        free_gpu_cache()
         self.set_slice(self.idx)
 
     def step_slice(self, d: int):
@@ -438,8 +523,14 @@ class MainWindow(QMainWindow):
     def on_embedded(self, key, emb):
         if key == self.pending_key:
             self.pending_key = None
-        if key[:3] != self._key()[:3]:
-            return  # model, image or channel changed meanwhile
+        if key[:3] == self._key()[:3]:  # else the model, image or channel changed meanwhile
+            self._store_embedding(key, emb)
+        if self.pending_key is None:
+            # The encoder needs gigabytes of scratch space that PyTorch would otherwise keep
+            # reserved; give it back once there is nothing left to embed.
+            free_gpu_cache()
+
+    def _store_embedding(self, key, emb):
         self.embeddings[key] = emb
         while len(self.embeddings) > MAX_CACHED_EMBEDDINGS:
             self.embeddings.popitem(last=False)
@@ -599,6 +690,26 @@ class MainWindow(QMainWindow):
     def _push_undo(self, group: list, next_id: int):
         if group:
             self.label_undo.append((group, next_id))
+            self._trim_undo()
+
+    def _trim_undo(self):
+        limit = self.settings.value("undo_limit", DEFAULT_UNDO_LIMIT, type=int)
+        if limit > 0:
+            del self.label_undo[:-limit]
+
+    def ask_undo_limit(self):
+        limit, ok = QInputDialog.getInt(
+            self,
+            "Undo history",
+            "Number of object edits kept for undo (0 = unlimited).\n"
+            "A propagation counts as one edit.",
+            self.settings.value("undo_limit", DEFAULT_UNDO_LIMIT, type=int),
+            0,
+            100000,
+        )
+        if ok:
+            self.settings.setValue("undo_limit", limit)
+            self._trim_undo()
 
     def commit(self):
         if self.mask is None or self.prop:
@@ -831,12 +942,15 @@ class MainWindow(QMainWindow):
 def main():
     ap = argparse.ArgumentParser(description="Interactive Segment Anything for microscopy images")
     ap.add_argument("image", nargs="?", help="image to open")
+    ap.add_argument("--lazy", action="store_true", help="keep stacks on disk and read slices on demand")
     ap.add_argument("-m", "--model", help="checkpoint path, or name of a cached model (e.g. vit_b_lm)")
     args = ap.parse_args()
 
     app = QApplication(sys.argv[:1])
     app.setApplicationName("SlugSam")
     win = MainWindow()
+    if args.lazy:
+        win.a_lazy.setChecked(True)
     win.show()
     if args.image:
         win.open_image(args.image)

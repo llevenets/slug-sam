@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -10,33 +11,77 @@ import tifffile
 IMAGE_FILTER = "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)"
 
 
+IMAGE_SUFFIXES = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+
+
+def next_image(path: Path) -> Path | None:
+    """The image after path in its folder, in natural name order, skipping label files."""
+    def key(p: Path):
+        return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", p.name)]
+
+    files = sorted(
+        (
+            f
+            for f in path.parent.iterdir()
+            if f.suffix.lower() in IMAGE_SUFFIXES and not f.stem.endswith("_labels") and f.is_file()
+        ),
+        key=key,
+    )
+    later = [f for f in files if key(f) > key(path)]
+    return later[0] if later else None
+
+
 class ImageStack:
-    """An image as N frames of (H, W) or (H, W, C); a plain 2D image has N == 1."""
+    """An image as N frames of (H, W) pixels, each with one or more channels.
 
-    def __init__(self, path: Path, data: np.ndarray, is_rgb: bool = False):
-        self.path = path
-        self.data = data
-        self.is_rgb = is_rgb  # the last axis holds colour samples rather than channels
+    The file keeps its own axis order. `read` fetches one (H, W) plane, or (H, W, S) for
+    colour-sample images, given an index over the leading (non-Y/X/S) axes, so the pixels
+    can live in memory, in a memory-mapped file, or be decoded from the file on demand.
+    """
 
-    @property
-    def channels(self) -> int:
-        return self.data.shape[3] if self.data.ndim == 4 else 1
+    def __init__(self, path, read, lead_shape, ch_axis, plane_shape, mode="in memory", close=None):
+        self.path = Path(path)
+        self._read = read
+        self._lead_shape = tuple(lead_shape)
+        self._ch_axis = ch_axis  # position of the channel axis among the leading axes, or None
+        self.frame_shape = tuple(plane_shape[:2])
+        self.is_rgb = len(plane_shape) == 3  # colour samples rather than separate channels
+        self.mode = mode
+        self._close = close
+        self._frames_shape = tuple(n for k, n in enumerate(self._lead_shape) if k != ch_axis)
+        if self.is_rgb:
+            self.channels = plane_shape[2]
+        else:
+            self.channels = self._lead_shape[ch_axis] if ch_axis is not None else 1
 
     def __len__(self):
-        return self.data.shape[0]
+        return int(np.prod(self._frames_shape, dtype=np.int64))
 
-    @property
-    def frame_shape(self) -> tuple[int, int]:
-        return self.data.shape[1:3]
+    def close(self):
+        if self._close:
+            self._close()
+        self._read = self._close = None
+
+    def frame(self, i: int, channel: int | None = None) -> np.ndarray:
+        """Frame i as (H, W) for one channel, or (H, W, C) with up to three channels for None."""
+        idx = list(np.unravel_index(i, self._frames_shape)) if self._frames_shape else []
+        if self._ch_axis is None:
+            f = np.asarray(self._read(tuple(idx)))
+            return f[..., channel] if self.is_rgb and channel is not None else f
+        idx.insert(self._ch_axis, 0)
+        chans = range(min(self.channels, 3)) if channel is None else [channel]
+        planes = []
+        for c in chans:
+            idx[self._ch_axis] = c
+            planes.append(np.asarray(self._read(tuple(idx))))
+        return planes[0] if channel is not None else np.stack(planes, axis=-1)
 
     def frame_rgb(self, i: int, channel: int | None = None) -> np.ndarray:
         """Frame i as contiguous (H, W, 3) uint8, contrast-stretched unless already uint8.
 
         channel selects a single channel, shown in grey; None composites the first three.
         """
-        f = self.data[i]
-        if f.ndim == 3 and channel is not None:
-            f = f[..., channel]
+        f = self.frame(i, channel)
         if f.ndim == 2:
             f = f[..., None]
         if f.dtype == bool:
@@ -67,34 +112,75 @@ def _stretch(ch: np.ndarray, lo_pct=0.5, hi_pct=99.9) -> np.ndarray:
     return np.clip(np.nan_to_num(out), 0, 255).astype(np.uint8)
 
 
-def load_image(path: str | Path) -> ImageStack:
+def load_image(path: str | Path, lazy: bool = False) -> ImageStack:
+    """Open an image. With lazy=True a TIFF's pixels stay on disk and are read slice by slice."""
     path = Path(path)
-    if path.suffix.lower() in (".tif", ".tiff"):
-        with tifffile.TiffFile(path) as tf:
-            series = tf.series[0]
-            arr, axes = series.asarray(), series.axes
-    else:
+    if path.suffix.lower() not in (".tif", ".tiff"):
         from PIL import Image
 
         arr = np.asarray(Image.open(path))
-        axes = "YX" if arr.ndim == 2 else "YXS"
-    return _to_stack(path, arr, axes)
+        return _array_stack(path, arr, "YX" if arr.ndim == 2 else "YXS")
+    if not lazy:
+        with tifffile.TiffFile(path) as tf:
+            series = tf.series[0]
+            return _array_stack(path, series.asarray(), series.axes)
+
+    tf = tifffile.TiffFile(path)
+    try:
+        series = tf.series[0]
+        axes, shape = series.axes, series.shape
+        try:  # uncompressed, contiguous files can be mapped straight into memory
+            arr = tifffile.memmap(path, series=0, mode="r")
+        except Exception:
+            arr = None
+        if arr is not None:
+            tf.close()
+            return _array_stack(path, arr, axes, mode="lazy, memory-mapped")
+        # otherwise decode single pages on demand, if the file stores one page per plane
+        if _plane_last(axes, len(shape)):
+            n_plane = 3 if axes.endswith("S") else 2
+            lead = shape[:-n_plane]
+            n_pages = int(np.prod(lead, dtype=np.int64))
+            pages = series.pages
+            if len(pages) == n_pages and tuple(pages[0].shape) == tuple(shape[-n_plane:]):
+
+                def read(idx):
+                    k = int(np.ravel_multi_index(idx, lead)) if lead else 0
+                    return pages[k].asarray()
+
+                ch = axes.index("C") if "C" in axes[:-n_plane] and n_plane == 2 else None
+                return ImageStack(
+                    path, read, lead, ch, shape[-n_plane:], "lazy, decoded per slice", tf.close
+                )
+        stack = _array_stack(path, series.asarray(), axes, mode="in memory (file layout prevents lazy loading)")
+        tf.close()
+        return stack
+    except Exception:
+        tf.close()
+        raise
 
 
-def _to_stack(path: Path, arr: np.ndarray, axes: str) -> ImageStack:
+def _plane_last(axes: str, ndim: int) -> bool:
+    return len(axes) == ndim and (axes.endswith("YX") or axes.endswith("YXS"))
+
+
+def _array_stack(path: Path, arr: np.ndarray, axes: str, mode: str = "in memory") -> ImageStack:
+    """Wrap an array (in memory or memory-mapped) without copying it."""
     if len(axes) != arr.ndim or "Y" not in axes or "X" not in axes:
         # unknown layout: assume (..., Y, X), or (..., Y, X, S) for a short last axis
         rgb = arr.ndim >= 3 and arr.shape[-1] in (3, 4) and arr.shape[-3] > 4
         axes = "Q" * (arr.ndim - (3 if rgb else 2)) + ("YXS" if rgb else "YX")
-    ch = next((a for a in "SC" if a in axes), None)
-    order = [i for i, a in enumerate(axes) if a not in ("Y", "X", ch)]
-    order += [axes.index("Y"), axes.index("X")]
-    if ch:
-        order.append(axes.index(ch))
-    arr = np.transpose(arr, order)
-    tail = arr.shape[-3:] if ch else arr.shape[-2:]
-    arr = arr.reshape((-1, *tail))
-    return ImageStack(path, arr, is_rgb=ch == "S")
+    if not _plane_last(axes, arr.ndim):  # move the image plane last; a view, not a copy
+        tail = [a for a in "YXS" if a in axes]
+        order = [a for a in axes if a not in tail] + tail
+        arr = np.transpose(arr, [axes.index(a) for a in order])
+        axes = "".join(order)
+    n_plane = 3 if axes.endswith("S") else 2
+    lead_axes = axes[:-n_plane]
+    ch = lead_axes.index("C") if "C" in lead_axes and n_plane == 2 else None
+    return ImageStack(
+        path, lambda idx: arr[idx], arr.shape[:-n_plane], ch, arr.shape[-n_plane:], mode
+    )
 
 
 def load_labels(path: Path, n: int, shape: tuple[int, int]) -> np.ndarray | None:
