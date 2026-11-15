@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import threading
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import torch
@@ -102,6 +103,7 @@ class SamModel:
     path: Path
     device: str
     model_type: str  # short human-readable description
+    supports_tracking = False  # whether track() is available
 
     def embed(self, rgb: np.ndarray) -> Embedding:
         """rgb: (H, W, 3) uint8."""
@@ -197,10 +199,17 @@ _SAM2_NAMES = {"t": "tiny", "s": "small", "b+": "base+", "l": "large"}
 
 
 class Sam2Model(SamModel):
-    """SAM 2 / SAM 2.1 (Hiera), used as a per-image model: embed once, then decode prompts."""
+    """SAM 2 / SAM 2.1 (Hiera).
+
+    Used per image like SAM (embed once, then decode prompts), and through track() as a
+    video model that follows objects across frames with its memory.
+    """
+
+    supports_tracking = True
 
     def __init__(self, path: Path, state: dict, device: str):
         try:
+            import sam2.sam2_video_predictor
             from sam2.build_sam import build_sam2
             from sam2.utils.transforms import SAM2Transforms
         except ImportError:
@@ -208,6 +217,8 @@ class Sam2Model(SamModel):
                 f"{path.name} is a SAM 2 checkpoint, but the 'sam2' package is not installed"
             ) from None
 
+        # the tracker wraps its frame loop in a terminal progress bar; the app shows its own
+        sam2.sam2_video_predictor.tqdm = lambda iterable, **_: iterable
         self.path, self.device = path, device
         width = state["image_encoder.trunk.patch_embed.proj.weight"].shape[0]
         blocks = len({k.split(".")[3] for k in state if k.startswith("image_encoder.trunk.blocks.")})
@@ -217,7 +228,17 @@ class Sam2Model(SamModel):
             raise ValueError(f"{path.name}: unrecognised SAM 2 model size") from None
         version = "sam2.1" if "no_obj_embed_spatial" in state else "sam2"
         self.model_type = f"SAM {version[3:]} {_SAM2_NAMES[size]}"
-        model = build_sam2(f"configs/{version}/{version}_hiera_{size}.yaml", None, device=device)
+        # Build the video predictor: it is the same network plus the tracking logic.
+        model = build_sam2(
+            f"configs/{version}/{version}_hiera_{size}.yaml",
+            None,
+            device=device,
+            hydra_overrides_extra=[
+                "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
+                # remember seed masks exactly as given, not a softened version
+                "++model.binarize_mask_from_pts_for_mem_enc=true",
+            ],
+        )
         model.load_state_dict(state)
         self.sam = model
         with warnings.catch_warnings():  # sam2 scripts its transforms with a deprecated API
@@ -268,6 +289,59 @@ class Sam2Model(SamModel):
             high_res_features=[f.float() for f in emb.features["high_res"]],
         )
         return low_res, iou[0]
+
+    def track(
+        self,
+        frame_rgb: Callable[[int], np.ndarray],
+        n_frames: int,
+        start: int,
+        masks: dict[int, np.ndarray],
+        reverse: bool = False,
+    ) -> Iterator[tuple[int, dict[int, np.ndarray]]]:
+        """Follow objects through a stack with SAM 2's video memory.
+
+        frame_rgb(i) returns frame i as (H, W, 3) uint8 and is only called for frames that
+        are visited. masks maps object id to its (H, W) bool mask on frame `start`.
+        Yields (frame index, {object id: mask}) for `start` and then each following
+        (or, with reverse, preceding) frame. Close the generator to stop early.
+        """
+        model, transform = self.sam, self.transform
+
+        class Frames:  # what the predictor indexes instead of a decoded video
+            def __len__(self):
+                return n_frames
+
+            def __getitem__(self, i):
+                return transform(frame_rgb(i))
+
+        height, width = next(iter(masks.values())).shape
+        device = torch.device(self.device)
+        state = {  # mirrors SAM2VideoPredictor.init_state(), minus loading a video file
+            "images": Frames(),
+            "num_frames": n_frames,
+            "offload_video_to_cpu": True,
+            "offload_state_to_cpu": False,
+            "video_height": height,
+            "video_width": width,
+            "device": device,
+            "storage_device": device,
+            "point_inputs_per_obj": {},
+            "mask_inputs_per_obj": {},
+            "cached_features": {},
+            "constants": {},
+            "obj_id_to_idx": OrderedDict(),
+            "obj_idx_to_id": OrderedDict(),
+            "obj_ids": [],
+            "output_dict_per_obj": {},
+            "temp_output_dict_per_obj": {},
+            "frames_tracked_per_obj": {},
+        }
+        for obj, mask in masks.items():
+            model.add_new_mask(state, start, obj, torch.from_numpy(mask))
+        frames = model.propagate_in_video(state, start_frame_idx=start, reverse=reverse)
+        for frame, ids, logits in frames:
+            found = (logits[:, 0] > 0).cpu().numpy()
+            yield frame, {obj: found[k] for k, obj in enumerate(ids)}
 
     def _upsample(self, low_res, emb):
         return F.interpolate(low_res.float(), emb.original_size, mode="bilinear", align_corners=False)

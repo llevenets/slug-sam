@@ -31,6 +31,7 @@ from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, load_mod
 EMBEDDING_CACHE_BYTES = 768 * 2**20  # device memory for cached embeddings: 4 MB (SAM) or 10 MB (SAM 2) per slice
 PREFETCH_RADIUS = 3  # neighbouring slices embedded ahead of time
 DEFAULT_UNDO_LIMIT = 50  # object edits kept for undo; 0 means unlimited
+VIDEO_ABSENT_FRAMES = 5  # SAM 2 video tracking gives up on an object unseen for this many slices
 DEFAULT_MIN_IOU = 0.3  # a tracked object is lost when it overlaps its previous slice less
 
 
@@ -53,8 +54,9 @@ HELP = """
 <tr><td><b>Shift+click</b></td><td>select an object: Enter then redraws it, on any slice, keeping its id</td></tr>
 <tr><td><b>P / Shift+P</b></td><td>with prompts placed: apply the same prompts on this and all
 following / previous slices.<br>Otherwise: track the selected (or hovered, or last) object
-through following / previous slices, until its overlap with the previous slice drops below
-<i>Track IoU</i></td></tr>
+through following / previous slices. <i>Tracking</i> in the toolbar picks how: <i>Overlap</i>
+re-prompts each slice from the previous mask until the overlap drops below <i>IoU</i>;
+<i>SAM 2 video</i> (SAM 2 models only) follows the object with the model's video memory</td></tr>
 <tr><td><b>Ctrl+P / Ctrl+Shift+P</b></td><td>track all objects on this slice forward / backward</td></tr>
 <tr><td><b>Wheel</b></td><td>zoom</td></tr>
 <tr><td><b>Middle drag / Space+drag</b></td><td>pan</td></tr>
@@ -240,7 +242,19 @@ class MainWindow(QMainWindow):
         self.slice_actions.append(tb.addWidget(self.slice_slider))
         self.slice_label = QLabel()
         self.slice_actions.append(tb.addWidget(self.slice_label))
-        self.slice_actions.append(tb.addWidget(QLabel(" Track IoU ≥ ")))
+        self.slice_actions.append(tb.addWidget(QLabel(" Tracking ")))
+        self.track_mode = QComboBox()
+        self.track_mode.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.track_mode.addItems(["Overlap", "SAM 2 video"])
+        self.track_mode.setToolTip(
+            "How P follows an object through the stack when no prompts are placed.\n"
+            "Overlap: prompt each slice from the previous mask; stops below the IoU threshold.\n"
+            "SAM 2 video: SAM 2's video memory; needs a SAM 2 model, copes with faster motion."
+        )
+        self.track_mode.setCurrentIndex(self.settings.value("track_mode", 0, type=int))
+        self.track_mode.currentIndexChanged.connect(self._track_mode_changed)
+        self.slice_actions.append(tb.addWidget(self.track_mode))
+        self.slice_actions.append(tb.addWidget(QLabel(" IoU ≥ ")))
         self.min_iou = QDoubleSpinBox()
         self.min_iou.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.min_iou.setRange(0.0, 0.95)
@@ -252,6 +266,7 @@ class MainWindow(QMainWindow):
         )
         self.min_iou.valueChanged.connect(lambda v: self.settings.setValue("min_iou", v))
         self.slice_actions.append(tb.addWidget(self.min_iou))
+        self.min_iou.setEnabled(self.track_mode.currentIndex() == 0)
         for a in self.slice_actions:
             a.setVisible(False)
 
@@ -279,6 +294,10 @@ class MainWindow(QMainWindow):
             tip.append(f"Main memory used by SlugSam: {m['ram'] / gb:.2f} GB")
         self.mem.setText("  " + " · ".join(parts) + " ")
         self.mem.setToolTip("\n".join(tip))
+
+    def _track_mode_changed(self, i: int):
+        self.settings.setValue("track_mode", i)
+        self.min_iou.setEnabled(i == 0)
 
     def _update_title(self):
         name = f"{self.stack.path.name}{'*' if self.dirty else ''} — " if self.stack else ""
@@ -469,7 +488,8 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(self.rgb)
         self._reset_prompts()
         self._refresh_labels()
-        self._ensure_embedding()
+        if not (self.prop and "video" in self.prop):  # video tracking embeds frames itself
+            self._ensure_embedding()
 
     def _channel_chosen(self, i: int):
         if self.stack is None or self.prop:
@@ -539,7 +559,8 @@ class MainWindow(QMainWindow):
             self.embeddings.popitem(last=False)
         if key == self._key():
             if self.prop:
-                self._propagate_work()
+                if "video" not in self.prop:
+                    self._propagate_work()
             else:
                 self.statusBar().showMessage("Ready", 2000)
                 self._update_prediction()
@@ -806,6 +827,9 @@ class MainWindow(QMainWindow):
             )
             return
         self._reset_prompts()
+        if self.track_mode.currentIndex() == 1:
+            self._propagate_video(direction, ids)
+            return
         self.slice_slider.setEnabled(False)
         self.prop = {
             "dir": direction,
@@ -883,7 +907,67 @@ class MainWindow(QMainWindow):
         )
         QTimer.singleShot(0, self._propagate_advance)
 
-    def _propagate_finish(self, stopped: bool = False):
+    def _propagate_video(self, direction: int, ids: list[int]):
+        """Track objects with SAM 2's video memory, seeded with their masks on this slice."""
+        if not self.model.supports_tracking:
+            self.statusBar().showMessage(
+                "SAM 2 video tracking needs a SAM 2 model: pick one, or set Tracking to Overlap", 6000
+            )
+            return
+        lab, stack, channel = self.labels[self.idx], self.stack, self.channel
+        frames = self.model.track(
+            lambda i: stack.frame_rgb(i, channel),
+            len(stack),
+            self.idx,
+            {i: lab == i for i in ids},
+            reverse=direction < 0,
+        )
+        self.slice_slider.setEnabled(False)
+        self.prop = {
+            "dir": direction,
+            "masks": dict.fromkeys(ids),  # objects still being followed
+            "absent": dict.fromkeys(ids, 0),  # consecutive slices each one was not found on
+            "n": len(ids),
+            "group": [],
+            "next_id": self.next_id,
+            "video": frames,
+            "start": self.idx,
+        }
+        self.statusBar().showMessage("Starting SAM 2 video tracking…")
+        QTimer.singleShot(0, self._propagate_video_step)
+
+    def _propagate_video_step(self):
+        p = self.prop
+        if p is None or "video" not in p:
+            return
+        try:
+            frame, masks = next(p["video"])
+        except StopIteration:
+            self._propagate_finish()
+            return
+        except Exception as e:  # e.g. CUDA out of memory
+            self._propagate_finish(error=f"{type(e).__name__}: {e}")
+            return
+        if frame != p["start"]:  # the start slice keeps the mask it was seeded with
+            for obj in list(p["masks"]):
+                mask = masks[obj]
+                if mask.any() and self._redraw_object(frame, obj, mask, p["group"]) is not None:
+                    p["absent"][obj] = 0
+                    p["last"] = frame
+                else:
+                    p["absent"][obj] += 1
+                    if p["absent"][obj] >= VIDEO_ABSENT_FRAMES:
+                        del p["masks"][obj]
+            self.slice_slider.setValue(frame)
+            self.statusBar().showMessage(
+                f"Tracking {len(p['masks'])}/{p['n']} object(s), slice {frame + 1} — Esc to stop"
+            )
+        if p["masks"]:
+            QTimer.singleShot(0, self._propagate_video_step)
+        else:
+            self._propagate_finish()
+
+    def _propagate_finish(self, stopped: bool = False, error: str = ""):
         p, self.prop = self.prop, None
         self.slice_slider.setEnabled(True)
         self.canvas.set_prompts([], None)
@@ -891,8 +975,17 @@ class MainWindow(QMainWindow):
         n = len({g[0] for g in p["group"]})
         lost = p["n"] - len(p["masks"])
         msg = f"Propagated {p['n']} object(s) onto {n} slice(s)"
-        if stopped:
+        if "video" in p:
+            p["video"].close()  # drops the tracker's memory of the stack
+            free_gpu_cache()
+            if not stopped and "last" in p:
+                self.slice_slider.setValue(p["last"])  # back to where something was last found
+        if error:
+            msg += f", failed: {error}"
+        elif stopped:
             msg += ", stopped"
+        elif lost and "video" in p:
+            msg += f"; {lost} no longer found" if p["n"] > 1 else f"; last found on slice {self.idx + 1}"
         elif lost:
             msg += f"; {lost} lost on the way" if p["n"] > 1 else f"; lost at slice {self.idx + 1}"
         self._ensure_embedding()
