@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import warnings
@@ -128,7 +129,15 @@ class SamModel:
         raise NotImplementedError
 
     def _upsample(self, low_res: torch.Tensor, emb: Embedding) -> torch.Tensor:
-        """Mask logits (1, k, h, w) resampled to the original image size."""
+        """Mask logits (n, k, h, w) resampled to the original image size."""
+        raise NotImplementedError
+
+    def _decode_points(self, emb: Embedding, xy: np.ndarray):
+        """One independent click per row of xy (B, 2): logits (B, 3, h, w) and quality (B, 3)."""
+        raise NotImplementedError
+
+    def _valid_low_res(self, emb: Embedding) -> tuple[int, int]:
+        """Height and width of the part of the low-res logits that shows the image."""
         raise NotImplementedError
 
     @torch.inference_mode()
@@ -205,6 +214,26 @@ class Sam1Model(SamModel):
 
     def _upsample(self, low_res, emb):
         return self.sam.postprocess_masks(low_res, emb.input_size, emb.original_size)
+
+    def _decode_points(self, emb, xy):
+        sam, dev = self.sam, self.device
+        xy = self.transform.apply_coords(xy, emb.original_size)
+        pts = (
+            torch.as_tensor(xy, dtype=torch.float, device=dev)[:, None],
+            torch.ones((len(xy), 1), dtype=torch.int, device=dev),
+        )
+        sparse, dense = sam.prompt_encoder(points=pts, boxes=None, masks=None)
+        return sam.mask_decoder(
+            image_embeddings=emb.features,
+            image_pe=sam.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=True,
+        )
+
+    def _valid_low_res(self, emb):  # the image is padded to a square at the bottom / right
+        scale = 256 / self.sam.image_encoder.img_size
+        return math.ceil(emb.input_size[0] * scale), math.ceil(emb.input_size[1] * scale)
 
 
 # (patch embedding width, number of trunk blocks) -> config name suffix
@@ -359,6 +388,30 @@ class Sam2Model(SamModel):
 
     def _upsample(self, low_res, emb):
         return F.interpolate(low_res.float(), emb.original_size, mode="bilinear", align_corners=False)
+
+    def _decode_points(self, emb, xy):
+        m, dev = self.sam, self.device
+        h, w = emb.original_size
+        xy = xy * np.array([m.image_size / w, m.image_size / h], dtype=np.float32)
+        pts = (
+            torch.as_tensor(xy, dtype=torch.float, device=dev)[:, None],
+            torch.ones((len(xy), 1), dtype=torch.int, device=dev),
+        )
+        sparse, dense = m.sam_prompt_encoder(points=pts, boxes=None, masks=None)
+        low_res, iou, _, _ = m.sam_mask_decoder(
+            image_embeddings=emb.features["image_embed"],
+            image_pe=m.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=True,
+            repeat_image=True,
+            high_res_features=[f.float() for f in emb.features["high_res"]],
+        )
+        return low_res, iou
+
+    def _valid_low_res(self, emb):  # the whole image is squashed into the square
+        n = self.sam.image_size // 4
+        return n, n
 
 
 def load_model(path: str | Path, device: str | None = None) -> SamModel:

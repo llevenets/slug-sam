@@ -14,7 +14,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
+    QFormLayout,
+    QSpinBox,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -24,6 +28,8 @@ from PySide6.QtWidgets import (
     QToolBar,
 )
 
+from . import tiles
+from .auto import grid_masks
 from .canvas import Canvas, make_lut
 from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, next_image, save_labels
 from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, load_model, memory_usage
@@ -58,7 +64,9 @@ through following / previous slices. <i>Tracking</i> in the toolbar picks how: <
 re-prompts each slice from the previous mask until the overlap drops below <i>IoU</i>;
 <i>SAM 2 video</i> (SAM 2 models only) follows the object with the model's video memory</td></tr>
 <tr><td><b>Ctrl+P / Ctrl+Shift+P</b></td><td>track all objects on this slice forward / backward</td></tr>
-<tr><td><b>Wheel</b></td><td>zoom</td></tr>
+<tr><td><b>A</b></td><td>auto-segment: prompt a grid of points over the view or the slice</td></tr>
+<tr><td><b>Wheel</b></td><td>zoom; on large images, zooming in also makes new masks finer
+(<i>View ▸ Adaptive detail</i>)</td></tr>
 <tr><td><b>Middle drag / Space+drag</b></td><td>pan</td></tr>
 <tr><td><b>R</b></td><td>fit image to window</td></tr>
 <tr><td><b>V</b></td><td>show / hide objects</td></tr>
@@ -83,7 +91,9 @@ class MainWindow(QMainWindow):
         self.channel: int | None = None  # None: composite of the first three channels
         self.active: int | None = None  # selected object id; commits redraw it instead of adding
         self.last_id: int | None = None
-        self.prop: dict | None = None  # state of a running propagation
+        self.prop: dict | None = None  # state of a running propagation or auto-segmentation
+        self.wanted_tile: tiles.Tile | None = None  # tile worth embedding next, for finer masks
+        self.prompt_level: int | None = None  # detail level the object being drawn started at
         self.rgb: np.ndarray | None = None
         self.labels: np.ndarray | None = None
         self.next_id = 1
@@ -104,6 +114,9 @@ class MainWindow(QMainWindow):
         self.canvas.boxDrawn.connect(self.set_box)
         self.canvas.modClicked.connect(self.on_mod_click)
         self.canvas.hovered.connect(self.on_hover)
+        self._view_timer = QTimer(self, singleShot=True, interval=250)
+        self._view_timer.timeout.connect(self._view_settled)
+        self.canvas.viewChanged.connect(self._view_timer.start)
 
         self.worker = EmbedWorker(self)
         self.worker.done.connect(self.on_embedded)
@@ -168,6 +181,13 @@ class MainWindow(QMainWindow):
         self.a_hover = self._action(
             "&Hover preview", self._hover_toggled, "H", checkable=True, checked=hover_on
         )
+        self.a_detail = self._action(
+            "Adaptive &detail (finer masks when zoomed in)",
+            self._detail_toggled,
+            checkable=True,
+            checked=self.settings.value("detail", True, type=bool),
+        )
+        a_auto = self._action("Auto-&segment…", self.ask_auto, "A")
         a_prev = self._action("&Previous slice", lambda: self.step_slice(-1), ",", Qt.Key.Key_Left)
         a_next = self._action("&Next slice", lambda: self.step_slice(1), ".", Qt.Key.Key_Right)
         a_help = self._action("&Shortcuts", self.show_help, "F1")
@@ -185,9 +205,10 @@ class MainWindow(QMainWindow):
         m.addActions([a_commit, a_cycle, a_clear, a_undo])
         m.addAction(a_undo_limit)
         m.addSeparator()
+        m.addAction(a_auto)
         m.addActions(a_prop)
         m = mb.addMenu("&View")
-        m.addActions([a_fit, self.a_show, self.a_hover])
+        m.addActions([a_fit, self.a_show, self.a_hover, self.a_detail])
         m.addSeparator()
         m.addActions([a_prev, a_next])
         mb.addMenu("&Help").addAction(a_help)
@@ -490,6 +511,7 @@ class MainWindow(QMainWindow):
         self.canvas.set_image(self.rgb)
         self._reset_prompts()
         self._refresh_labels()
+        self.wanted_tile = self._view_tile()
         if not (self.prop and "video" in self.prop):  # video tracking embeds frames itself
             self._ensure_embedding()
 
@@ -518,35 +540,50 @@ class MainWindow(QMainWindow):
             self.open_image(urls[0].toLocalFile())
 
     # ---- embeddings ----------------------------------------------------
+    # Each slice is embedded as a whole (tile None). On large images, parts of the current
+    # slice are additionally embedded as tiles at higher resolution, chosen by the zoom.
 
-    def _key(self, idx: int | None = None):
-        return (id(self.model), self.stack_id, self.channel, self.idx if idx is None else idx)
+    def _key(self, idx: int | None = None, tile: tiles.Tile | None = None):
+        return (id(self.model), self.stack_id, self.channel, self.idx if idx is None else idx, tile)
 
-    def _embedding(self):
+    def _embedding(self, tile: tiles.Tile | None = None):
         if self.model is None or self.stack is None:
             return None
-        emb = self.embeddings.get(self._key())
+        key = self._key(tile=tile)
+        emb = self.embeddings.get(key)
         if emb is not None:
-            self.embeddings.move_to_end(self._key())
+            self.embeddings.move_to_end(key)
         return emb
 
-    def _ensure_embedding(self):
-        if self.model is None or self.stack is None:
-            return
-        if self._embedding() is not None:
-            self._prefetch()
-            return
-        key = self._key()
+    def _request(self, key, rgb):
         if key != self.pending_key:
             self.pending_key = key
-            self.worker.request(key, self.model, self.rgb)
-        self.statusBar().showMessage("Computing image embedding… (you can already place prompts)")
+            self.worker.request(key, self.model, rgb)
+
+    def _crop(self, tile: tiles.Tile) -> np.ndarray:
+        y, x, h, w = tile
+        return np.ascontiguousarray(self.rgb[y : y + h, x : x + w])
+
+    def _ensure_embedding(self):
+        """Ask for the most useful missing embedding: this slice, then a finer tile, then neighbours."""
+        if self.model is None or self.stack is None:
+            return
+        if self.prop and ("video" in self.prop or "auto" in self.prop):
+            return  # these embed what they need themselves
+        if self._embedding() is None:
+            self._request(self._key(), self.rgb)
+            self.statusBar().showMessage("Computing image embedding… (you can already place prompts)")
+        elif self.wanted_tile is not None and self._key(tile=self.wanted_tile) not in self.embeddings:
+            self._request(self._key(tile=self.wanted_tile), self._crop(self.wanted_tile))
+        else:
+            self._prefetch()
 
     def on_embedded(self, key, emb):
         if key == self.pending_key:
             self.pending_key = None
         if key[:3] == self._key()[:3]:  # else the model, image or channel changed meanwhile
             self._store_embedding(key, emb)
+            self._ensure_embedding()
         if self.pending_key is None:
             # The encoder needs gigabytes of scratch space that PyTorch would otherwise keep
             # reserved; give it back once there is nothing left to embed.
@@ -559,18 +596,88 @@ class MainWindow(QMainWindow):
             and sum(e.nbytes for e in self.embeddings.values()) > EMBEDDING_CACHE_BYTES
         ):
             self.embeddings.popitem(last=False)
-        if key == self._key():
-            if self.prop:
-                if "video" not in self.prop:
-                    self._propagate_work()
-            else:
-                self.statusBar().showMessage("Ready", 2000)
-                self._update_prediction()
-            self._prefetch()
-        elif self._embedding() is None:
-            self._ensure_embedding()  # a prefetch finished while the current slice still waits
+        if key[3] != self.idx:
+            return
+        if self.prop:
+            if key[4] is None and not ("video" in self.prop or "auto" in self.prop):
+                self._propagate_work()
+        elif self._has_prompts():
+            self._update_prediction()  # first mask, or the same mask in finer detail
         else:
-            self._prefetch()
+            if key[4] is None:
+                self.statusBar().showMessage("Ready", 2000)
+            self._do_hover()
+
+    # ---- detail levels ---------------------------------------------------
+
+    def _detail_toggled(self, on: bool):
+        self.settings.setValue("detail", on)
+        self._view_settled()
+
+    def _view_level(self) -> int:
+        """Detail level matching the zoom: the finest whose tiles still span what is on screen."""
+        if self.stack is None or not self.a_detail.isChecked():
+            return 0
+        shape = self.stack.frame_shape
+        x0, y0, x1, y1 = self.canvas.visible_rect()
+        span = max(x1 - x0, y1 - y0, 1.0)
+        level = 0
+        while level < tiles.max_level(shape) and tiles.tile_side(shape, level + 1) >= span:
+            level += 1
+        return level
+
+    def _view_tile(self) -> tiles.Tile | None:
+        """The tile at the zoom's detail level around the centre of the view."""
+        if self.stack is None:
+            return None
+        x0, y0, x1, y1 = self.canvas.visible_rect()
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        return tiles.tile_for(self.stack.frame_shape, self._view_level(), (cx, cy, cx, cy))
+
+    def _view_settled(self):
+        if self.stack is None or self.prop:
+            return
+        if not self._has_prompts():
+            self.wanted_tile = self._view_tile()
+        self._ensure_embedding()
+
+    def _predict(self, points, box=None, choice=None, level: int | None = None):
+        """Decode prompts on the finest embedded tile that holds them all.
+
+        Returns (full-frame mask, score, number of candidates, detail factor), or None while
+        nothing is embedded yet. If a finer tile than the one used would fit, it is requested
+        and the caller is run again when it arrives.
+        """
+        shape = self.stack.frame_shape
+        level = self._view_level() if level is None else level
+        xs = [p[0] for p in points] + ([box[0], box[2]] if box else [])
+        ys = [p[1] for p in points] + ([box[1], box[3]] if box else [])
+        bbox = (min(xs), min(ys), max(xs), max(ys))
+        emb, tile, wanted = self._embedding(), None, None
+        for lvl in range(level, 0, -1):
+            t = tiles.tile_for(shape, lvl, bbox)
+            if t is None:
+                continue
+            wanted = wanted or t
+            e = self._embedding(t)
+            if e is not None:
+                emb, tile = e, t
+                break
+        if wanted is not None and wanted != tile:
+            self.wanted_tile = wanted
+            self._ensure_embedding()
+        if emb is None:
+            return None
+        if tile is None:
+            return (*self.model.predict(emb, points, box, choice), 1)
+        y, x, h, w = tile
+        points = [(px - x, py - y, pos) for px, py, pos in points]
+        if box:
+            box = (box[0] - x, box[1] - y, box[2] - x, box[3] - y)
+        part, score, n = self.model.predict(emb, points, box, choice)
+        mask = np.zeros(shape, bool)
+        mask[y : y + h, x : x + w] = part
+        return mask, score, n, round(max(shape) / max(h, w))
 
     def on_embed_failed(self, key, msg):
         if key == self.pending_key:
@@ -595,6 +702,8 @@ class MainWindow(QMainWindow):
         return bool(self.points) or self.box is not None
 
     def _snapshot(self):
+        if not self._has_prompts():
+            self.prompt_level = self._view_level()  # zooming later must not change this object
         self.prompt_undo.append((list(self.points), self.box, self.choice))
 
     def add_point(self, x: float, y: float, positive: bool):
@@ -632,6 +741,7 @@ class MainWindow(QMainWindow):
 
     def _reset_prompts(self):
         self.points, self.box, self.choice, self.mask = [], None, None, None
+        self.prompt_level = None
         self.prompt_undo.clear()
         self.canvas.set_prompts([], None)
         self.canvas.set_preview(None)
@@ -645,12 +755,16 @@ class MainWindow(QMainWindow):
             self.mask = None
             self.canvas.set_preview(None)
             return
-        emb = self._embedding()
-        if emb is None:
+        if self.model is None:
             return
-        self.mask, score, n = self.model.predict(emb, self.points, self.box, self.choice)
+        result = self._predict(self.points, self.box, self.choice, self.prompt_level)
+        if result is None:
+            return
+        self.mask, score, n, detail = result
         self.canvas.set_preview(self.mask, self._color(), 110)
         alt = f"alternative {(self.choice or 0) + 1}/{n}, " if n > 1 else ""
+        if detail > 1:
+            alt += f"detail ×{detail}, "
         prop = ", P to apply these prompts on following slices" if len(self.stack) > 1 else ""
         self.statusBar().showMessage(
             f"Mask: {alt}score {score:.2f} — Enter to commit{prop}, Tab for alternatives, Esc to clear"
@@ -664,15 +778,15 @@ class MainWindow(QMainWindow):
     def _do_hover(self):
         if self._has_prompts() or self.prop or not self.a_hover.isChecked():
             return
-        emb = self._embedding()
-        if emb is None:
+        if self.model is None or self.stack is None or self._hover_pos is None:
             return
         x, y = self._hover_pos
         if x < 0 or self.labels[self.idx][int(y), int(x)]:
             self.canvas.set_preview(None)
             return
-        mask, _, _ = self.model.predict(emb, [(x, y, True)])
-        self.canvas.set_preview(mask, self._color(), 45)
+        result = self._predict([(x, y, True)])
+        if result is not None:
+            self.canvas.set_preview(result[0], self._color(), 45)
 
     # ---- objects -------------------------------------------------------
 
@@ -969,8 +1083,161 @@ class MainWindow(QMainWindow):
         else:
             self._propagate_finish()
 
+    # ---- automatic segmentation -------------------------------------------
+
+    def ask_auto(self):
+        """Dialog for the grid-prompt segmentation settings; runs it on OK."""
+        if self.stack is None or self.model is None or self.prop:
+            return
+        st, shape = self.settings, self.stack.frame_shape
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Auto-segment")
+        form = QFormLayout(dlg)
+        scope = QComboBox()
+        scope.addItems(["Visible area", "Whole slice"])
+        scope.setCurrentIndex(st.value("auto/scope", 0, type=int))
+        detail = QComboBox()
+        for lvl in range(tiles.max_level(shape) + 1):
+            n = len(tiles.tiles(shape, lvl))
+            detail.addItem(f"×{2**lvl}  ({n} tile{'s' if n > 1 else ''} per slice)" if lvl else "×1  (slice as a whole)")
+        detail.setCurrentIndex(self._view_level())
+        detail.setToolTip("Higher detail finds smaller objects, in more and smaller tiles.\nDefaults to the current zoom.")
+        grid = QSpinBox()
+        grid.setRange(4, 64)
+        grid.setValue(st.value("auto/grid", 32, type=int))
+        grid.setToolTip("Points prompted along the long side of each tile")
+        score = QDoubleSpinBox()
+        score.setRange(0.0, 1.0)
+        score.setSingleStep(0.05)
+        score.setValue(st.value("auto/score", 0.8, type=float))
+        score.setToolTip("Minimum quality the model predicts for a mask.\nFine-tuned models often score lower: try 0.5 if little is found.")
+        min_area = QSpinBox()
+        min_area.setRange(0, 10**7)
+        min_area.setSuffix(" px")
+        min_area.setValue(st.value("auto/min_area", 30, type=int))
+        max_area = QDoubleSpinBox()
+        max_area.setRange(0.01, 100.0)
+        max_area.setSuffix(" % of slice")
+        max_area.setValue(st.value("auto/max_area", 25.0, type=float))
+        form.addRow("Area", scope)
+        form.addRow("Detail", detail)
+        form.addRow("Grid points per side", grid)
+        form.addRow("Min. quality", score)
+        form.addRow("Min. object size", min_area)
+        form.addRow("Max. object size", max_area)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        st.setValue("auto/scope", scope.currentIndex())
+        st.setValue("auto/grid", grid.value())
+        st.setValue("auto/score", score.value())
+        st.setValue("auto/min_area", min_area.value())
+        st.setValue("auto/max_area", max_area.value())
+        self.auto_segment(
+            visible_only=scope.currentIndex() == 0,
+            level=detail.currentIndex(),
+            points_per_side=grid.value(),
+            min_score=score.value(),
+            min_area=min_area.value(),
+            max_area_pct=max_area.value(),
+        )
+
+    def auto_segment(self, visible_only=True, level=0, points_per_side=32, min_score=0.8, min_area=30, max_area_pct=25.0):
+        """Add an object for everything a grid of point prompts finds; existing objects are kept."""
+        if self.stack is None or self.model is None or self.prop or self._embedding() is None:
+            return
+        self._reset_prompts()
+        shape = self.stack.frame_shape
+        area = self.canvas.visible_rect() if visible_only else (0.0, 0.0, float(shape[1]), float(shape[0]))
+        # Each tile handles the grid points in its core, clipped to the requested area.
+        todo = []
+        for t in tiles.tiles(shape, level) if level else [(0, 0, *shape)]:
+            c = tiles.core(shape, t)
+            region = (max(c[0], area[0]), max(c[1], area[1]), min(c[2], area[2]), min(c[3], area[3]))
+            if region[0] < region[2] and region[1] < region[3]:
+                todo.append((t, region))
+        self.slice_slider.setEnabled(False)
+        self.prop = {"group": [], "next_id": self.next_id, "count": 0}
+        self.prop["auto"] = self._auto_steps(
+            self.prop, todo, level, area, points_per_side, min_score, min_area, max_area_pct / 100 * shape[0] * shape[1]
+        )
+        QTimer.singleShot(0, self._auto_step)
+
+    def _auto_steps(self, p, todo, level, area, points_per_side, min_score, min_area, max_area):
+        """Generator doing the work in small pieces; yields a status text after each."""
+        shape, idx = self.stack.frame_shape, self.idx
+        for k, (tile, region) in enumerate(todo):
+            where = f"tile {k + 1}/{len(todo)}" if len(todo) > 1 else "slice"
+            y, x, h, w = tile
+            region = (region[0] - x, region[1] - y, region[2] - x, region[3] - y)
+            key = self._key(tile=tile if level else None)
+            emb = self.embeddings.get(key)
+            if emb is None:
+                yield f"Auto-segmenting {where}: embedding… — Esc to stop"
+                emb = self.embeddings[key] = self.model.embed(self._crop(tile))
+            # masks may only touch a tile border where that is also the border of the image
+            edges = (y == 0, x == 0, y + h == shape[0], x + w == shape[1])
+            found = []
+            for step in grid_masks(self.model, emb, points_per_side, min_score, min_area, max_area, edges, region):
+                if isinstance(step, list):
+                    found = step
+                else:
+                    yield f"Auto-segmenting {where}: {step:.0%}, {p['count']} objects so far — Esc to stop"
+            if self.next_id + len(found) > np.iinfo(self.labels.dtype).max:
+                self.labels = self.labels.astype(np.uint32)
+            lab = self.labels[idx]
+            for mask, my, mx, _ in found:  # best first
+                sl = (slice(y + my, y + my + mask.shape[0]), slice(x + mx, x + mx + mask.shape[1]))
+                cy, cx = (sl[0].start + sl[0].stop) / 2, (sl[1].start + sl[1].stop) / 2
+                if not (area[0] <= cx <= area[2] and area[1] <= cy <= area[3]):
+                    continue
+                free = mask & (lab[sl] == 0)
+                n = int(free.sum())
+                if n < 0.5 * mask.sum() or n < min_area:
+                    continue  # mostly an object that is already there
+                p["group"].append((idx, sl, lab[sl].copy()))
+                lab[sl][free] = self.next_id
+                self.next_id += 1
+                p["count"] += 1
+            self.dirty = True
+            self._refresh_labels()
+            free_gpu_cache()
+            yield f"Auto-segmenting: {where} done, {p['count']} objects so far — Esc to stop"
+
+    def _auto_step(self):
+        p = self.prop
+        if p is None or "auto" not in p:
+            return
+        try:
+            self.statusBar().showMessage(next(p["auto"]))
+        except StopIteration:
+            self._propagate_finish()
+            return
+        except Exception as e:  # e.g. CUDA out of memory
+            self._propagate_finish(error=f"{type(e).__name__}: {e}")
+            return
+        QTimer.singleShot(0, self._auto_step)
+
+    def _auto_finish(self, p, stopped: bool, error: str):
+        p["auto"].close()
+        self.slice_slider.setEnabled(True)
+        self._push_undo(p["group"], p["next_id"])
+        self.last_id = None
+        self._refresh_labels()
+        free_gpu_cache()
+        msg = f"Auto-segmentation added {p['count']} object(s)"
+        msg += f", failed: {error}" if error else ", stopped" if stopped else ""
+        self._ensure_embedding()
+        self.statusBar().showMessage(msg + (" — Ctrl+Z undoes it" if p["count"] else ""))
+
     def _propagate_finish(self, stopped: bool = False, error: str = ""):
         p, self.prop = self.prop, None
+        if "auto" in p:
+            self._auto_finish(p, stopped, error)
+            return
         self.slice_slider.setEnabled(True)
         self.canvas.set_prompts([], None)
         self._push_undo(p["group"], p["next_id"])

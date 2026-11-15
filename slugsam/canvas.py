@@ -40,6 +40,7 @@ class Canvas(QGraphicsView):
     modClicked = Signal(float, float, bool, bool)  # x, y, ctrl, shift: click with a modifier held
     boxDrawn = Signal(float, float, float, float)
     hovered = Signal(float, float)  # image coords, or (-1, -1) when off the image
+    viewChanged = Signal()  # zoomed, panned or resized
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -131,6 +132,13 @@ class Canvas(QGraphicsView):
         if h and w:
             self.fitInView(QRectF(0, 0, w, h), Qt.AspectRatioMode.KeepAspectRatio)
             self._update_smoothing()
+            self.viewChanged.emit()
+
+    def visible_rect(self) -> tuple[float, float, float, float]:
+        """The part of the image on screen, as (x0, y0, x1, y1) in image pixels."""
+        r = self.mapToScene(self.viewport().rect()).boundingRect()
+        h, w = self._shape
+        return (max(r.left(), 0.0), max(r.top(), 0.0), min(r.right(), float(w)), min(r.bottom(), float(h)))
 
     def _update_smoothing(self):
         smooth = self.transform().m11() < 1.0  # crisp pixels when zoomed in
@@ -157,6 +165,7 @@ class Canvas(QGraphicsView):
         if 0.01 < scale < 80:
             self.scale(factor, factor)
             self._update_smoothing()
+            self.viewChanged.emit()
 
     def mousePressEvent(self, ev):
         self.setFocus()
@@ -186,6 +195,7 @@ class Canvas(QGraphicsView):
             self._pan = pos
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
+            self.viewChanged.emit()
             return
         if self._press is not None:
             if self._drag_box is None and (pos - self._press).manhattanLength() < DRAG_THRESHOLD:
@@ -242,6 +252,7 @@ class Canvas(QGraphicsView):
         super().resizeEvent(ev)
         if not ev.oldSize().isValid() or ev.oldSize().isEmpty():
             self.fit()
+        self.viewChanged.emit()
 
     # ---- prompt markers, drawn in screen space so they keep their size ----
 
