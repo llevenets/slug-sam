@@ -282,13 +282,15 @@ class MainWindow(QMainWindow):
     def _update_memory(self):
         m, gb = memory_usage(), 2**30
         parts, tip = [], []
-        if "gpu_total" in m:
-            parts.append(f"GPU {m['gpu_used'] / gb:.1f}/{m['gpu_total'] / gb:.1f} GB")
-            tip.append(
-                f"GPU memory in use on the whole device: {m['gpu_used'] / gb:.2f} GB\n"
-                f"  held by SlugSam: {m['gpu_ours'] / gb:.2f} GB, of which live "
-                f"(model + {len(self.embeddings)} cached embeddings): {m['gpu_live'] / gb:.2f} GB"
-            )
+        if "gpu_ours" in m:
+            held = f"held by SlugSam: {m['gpu_ours'] / gb:.2f} GB, of which live " \
+                   f"(model + {len(self.embeddings)} cached embeddings): {m['gpu_live'] / gb:.2f} GB"
+            if "gpu_total" in m:
+                parts.append(f"GPU {m['gpu_used'] / gb:.1f}/{m['gpu_total'] / gb:.1f} GB")
+                tip.append(f"GPU memory in use on the whole device: {m['gpu_used'] / gb:.2f} GB\n  {held}")
+            else:
+                parts.append(f"GPU {m['gpu_ours'] / gb:.1f} GB")
+                tip.append(f"GPU memory {held}")
         if "ram" in m:
             parts.append(f"RAM {m['ram'] / gb:.1f} GB")
             tip.append(f"Main memory used by SlugSam: {m['ram'] / gb:.2f} GB")

@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 import numpy as np
+import platformdirs
+import psutil
 import torch
 import torch.nn.functional as F
 from PySide6.QtCore import QThread, Signal
@@ -26,10 +28,18 @@ def pick_device() -> str:
     return "cpu"
 
 
+def _micro_sam_cache_dirs() -> list[Path]:
+    """Where micro_sam keeps its downloads: $MICROSAM_CACHEDIR, else the per-OS user cache."""
+    dirs = [Path(platformdirs.user_cache_dir("micro_sam"))]  # same rule micro_sam uses (via pooch)
+    if os.environ.get("MICROSAM_CACHEDIR"):
+        dirs.insert(0, Path(os.environ["MICROSAM_CACHEDIR"]).expanduser())
+    return dirs
+
+
 def find_models() -> list[Path]:
     """Checkpoints in the micro_sam cache, the models folders and $SLUGSAM_MODELS."""
     dirs = [
-        Path.home() / ".cache" / "micro_sam" / "models",
+        *(d / "models" for d in _micro_sam_cache_dirs()),
         Path(__file__).resolve().parent.parent / "models",  # next to the source checkout
         Path.cwd() / "models",
     ]
@@ -54,15 +64,16 @@ def free_gpu_cache():
     """Return memory PyTorch holds but no longer uses (e.g. encoder scratch space) to the GPU."""
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+    elif torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
 
 def memory_usage() -> dict:
     """Current memory figures in bytes; keys are absent where a figure is unavailable."""
     out = {}
     try:
-        with open("/proc/self/statm") as f:
-            out["ram"] = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    except OSError:
+        out["ram"] = psutil.Process().memory_info().rss
+    except psutil.Error:
         pass
     if torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info()
@@ -70,6 +81,9 @@ def memory_usage() -> dict:
         out["gpu_total"] = total
         out["gpu_ours"] = torch.cuda.memory_reserved()
         out["gpu_live"] = torch.cuda.memory_allocated()
+    elif torch.backends.mps.is_available():  # Apple GPUs share main memory: no device total
+        out["gpu_ours"] = torch.mps.driver_allocated_memory()
+        out["gpu_live"] = torch.mps.current_allocated_memory()
     return out
 
 

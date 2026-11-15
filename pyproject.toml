@@ -13,6 +13,8 @@ dependencies = [
     "torch",
     "torchvision",
     "sam2>=1.1.0",
+    "psutil>=7.2.2",
+    "platformdirs>=4.14.5",
 ]
 
 [project.scripts]
