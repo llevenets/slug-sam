@@ -26,9 +26,9 @@ from PySide6.QtWidgets import (
 
 from .canvas import Canvas, make_lut
 from .data import IMAGE_FILTER, ImageStack, load_image, load_labels, next_image, save_labels
-from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, memory_usage
+from .engine import EmbedWorker, SamModel, find_models, free_gpu_cache, load_model, memory_usage
 
-MAX_CACHED_EMBEDDINGS = 128  # ~4 MB each, kept on the model device
+EMBEDDING_CACHE_BYTES = 768 * 2**20  # device memory for cached embeddings: 4 MB (SAM) or 10 MB (SAM 2) per slice
 PREFETCH_RADIUS = 3  # neighbouring slices embedded ahead of time
 DEFAULT_UNDO_LIMIT = 50  # object edits kept for undo; 0 means unlimited
 DEFAULT_MIN_IOU = 0.3  # a tracked object is lost when it overlaps its previous slice less
@@ -289,7 +289,7 @@ class MainWindow(QMainWindow):
         if self.active:
             parts.insert(0, f"editing object {self.active} (Esc to deselect)")
         if self.model:
-            parts.append(f"{self.model.path.name} ({self.model.model_type}, {self.model.device})")
+            parts.append(f"{self.model.model_type} on {self.model.device}")
         self.info.setText("  |  ".join(parts))
 
     def show_help(self):
@@ -323,7 +323,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
-            model = SamModel(path)
+            model = load_model(path)
         except Exception as e:
             QMessageBox.warning(self, "SlugSam", f"Could not load {path.name}:\n{e}")
             self._sync_model_combo()
@@ -532,7 +532,10 @@ class MainWindow(QMainWindow):
 
     def _store_embedding(self, key, emb):
         self.embeddings[key] = emb
-        while len(self.embeddings) > MAX_CACHED_EMBEDDINGS:
+        while (
+            len(self.embeddings) > 2 * PREFETCH_RADIUS + 1
+            and sum(e.nbytes for e in self.embeddings.values()) > EMBEDDING_CACHE_BYTES
+        ):
             self.embeddings.popitem(last=False)
         if key == self._key():
             if self.prop:

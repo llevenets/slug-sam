@@ -12,6 +12,7 @@ dependencies = [
     "imagecodecs",
     "torch",
     "torchvision",
+    "sam2>=1.1.0",
 ]
 
 [project.scripts]

@@ -1,17 +1,18 @@
-"""Thin wrapper around segment_anything: load a checkpoint, embed images, decode prompts."""
+"""Model backends (SAM, SAM 2): load a checkpoint, embed images, decode prompts."""
 
 from __future__ import annotations
 
 import os
 import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PySide6.QtCore import QThread, Signal
-from segment_anything import sam_model_registry
-from segment_anything.utils.transforms import ResizeLongestSide
 
 _EMBED_DIM_TO_TYPE = {768: "vit_b", 1024: "vit_l", 1280: "vit_h"}
 
@@ -25,12 +26,16 @@ def pick_device() -> str:
 
 
 def find_models() -> list[Path]:
-    """Checkpoints in the micro_sam cache, ./models and $SLUGSAM_MODELS."""
-    dirs = [Path.home() / ".cache" / "micro_sam" / "models", Path.cwd() / "models"]
+    """Checkpoints in the micro_sam cache, the models folders and $SLUGSAM_MODELS."""
+    dirs = [
+        Path.home() / ".cache" / "micro_sam" / "models",
+        Path(__file__).resolve().parent.parent / "models",  # next to the source checkout
+        Path.cwd() / "models",
+    ]
     if os.environ.get("SLUGSAM_MODELS"):
         dirs.append(Path(os.environ["SLUGSAM_MODELS"]))
     found = []
-    for d in dirs:
+    for d in dict.fromkeys(p.resolve() for p in dirs):
         if not d.is_dir():
             continue
         for f in sorted(d.iterdir()):
@@ -69,67 +74,46 @@ def memory_usage() -> dict:
 
 @dataclass
 class Embedding:
-    features: torch.Tensor  # (1, 256, 64, 64) on the model device
+    features: Any  # backend-specific tensors on the model device
     original_size: tuple[int, int]  # (H, W)
-    input_size: tuple[int, int]  # (H, W) after resizing the long side to 1024
+    input_size: tuple[int, int]  # (H, W) of the image as fed to the encoder
+    nbytes: int = 0  # device memory held by features
+
+
+def _nbytes(*tensors: torch.Tensor) -> int:
+    return sum(t.numel() * t.element_size() for t in tensors)
+
+
+def _prompt_arrays(points, box):
+    """Prompts as float arrays in image pixels: (xy (N, 2), labels (N,)) or None, box (4,) or None."""
+    pts = None
+    if points:
+        xy = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
+        pts = (xy, np.array([1 if p[2] else 0 for p in points], dtype=np.int32))
+    return pts, None if box is None else np.array(box, dtype=np.float32)
 
 
 class SamModel:
-    def __init__(self, path: str | Path, device: str | None = None):
-        self.path = Path(path)
-        self.device = device or pick_device()
-        state = torch.load(self.path, map_location="cpu", weights_only=True)
-        # micro_sam fine-tuning checkpoints wrap the weights
-        if "model_state" in state:
-            state = {k.removeprefix("sam."): v for k, v in state["model_state"].items()}
-        elif "model" in state and isinstance(state["model"], dict):
-            state = state["model"]
-        try:
-            dim = state["image_encoder.pos_embed"].shape[-1]
-            self.model_type = _EMBED_DIM_TO_TYPE[dim]
-        except KeyError:
-            raise ValueError(
-                f"{self.path.name} is not a ViT-B/L/H Segment Anything checkpoint"
-            ) from None
-        sam = sam_model_registry[self.model_type](checkpoint=None)
-        sam.load_state_dict(state)
-        self.sam = sam.to(self.device).eval()
-        self.transform = ResizeLongestSide(sam.image_encoder.img_size)
+    """A loaded promptable segmentation model. Use load_model() to get the right backend.
 
-    @torch.inference_mode()
+    Backends provide embed(), _decode() and _upsample(); everything above is shared.
+    """
+
+    path: Path
+    device: str
+    model_type: str  # short human-readable description
+
     def embed(self, rgb: np.ndarray) -> Embedding:
         """rgb: (H, W, 3) uint8."""
-        resized = self.transform.apply_image(rgb)
-        x = torch.as_tensor(resized, device=self.device).permute(2, 0, 1)[None].float()
-        input_size = tuple(x.shape[-2:])
-        features = self.sam.image_encoder(self.sam.preprocess(x))
-        return Embedding(features, rgb.shape[:2], input_size)
+        raise NotImplementedError
 
     def _decode(self, emb: Embedding, points, box, multimask: bool):
-        """Low-res mask logits (1, k, 256, 256) and predicted quality (k,) for the prompts."""
-        sam, dev = self.sam, self.device
-        pts = None
-        if points:
-            xy = np.array([[p[0], p[1]] for p in points], dtype=np.float32)
-            xy = self.transform.apply_coords(xy, emb.original_size)
-            lab = [1 if p[2] else 0 for p in points]
-            pts = (
-                torch.as_tensor(xy, dtype=torch.float, device=dev)[None],
-                torch.as_tensor(lab, dtype=torch.int, device=dev)[None],
-            )
-        bx = None
-        if box is not None:
-            b = self.transform.apply_boxes(np.array([box], dtype=np.float32), emb.original_size)
-            bx = torch.as_tensor(b, dtype=torch.float, device=dev)
-        sparse, dense = sam.prompt_encoder(points=pts, boxes=bx, masks=None)
-        low_res, iou = sam.mask_decoder(
-            image_embeddings=emb.features,
-            image_pe=sam.prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse,
-            dense_prompt_embeddings=dense,
-            multimask_output=multimask,
-        )
-        return low_res, iou[0]
+        """Low-res mask logits (1, k, h, w) and predicted quality (k,) for the prompts."""
+        raise NotImplementedError
+
+    def _upsample(self, low_res: torch.Tensor, emb: Embedding) -> torch.Tensor:
+        """Mask logits (1, k, h, w) resampled to the original image size."""
+        raise NotImplementedError
 
     @torch.inference_mode()
     def predict(self, emb: Embedding, points=(), box=None, choice: int | None = None):
@@ -145,15 +129,166 @@ class SamModel:
         low_res, iou = self._decode(emb, points, box, multimask)
         order = torch.argsort(iou, descending=True)
         k = int(order[(choice or 0) % len(order)])
-        mask = self.sam.postprocess_masks(low_res[:, k : k + 1], emb.input_size, emb.original_size)
+        mask = self._upsample(low_res[:, k : k + 1], emb)
         return (mask[0, 0] > 0).cpu().numpy(), float(iou[k]), len(order)
 
     @torch.inference_mode()
     def predict_candidates(self, emb: Embedding, points=(), box=None) -> np.ndarray:
         """All three candidate masks for the prompts, as (3, H, W) bool."""
         low_res, _ = self._decode(emb, points, box, True)
-        masks = self.sam.postprocess_masks(low_res, emb.input_size, emb.original_size)
-        return (masks[0] > 0).cpu().numpy()
+        return (self._upsample(low_res, emb)[0] > 0).cpu().numpy()
+
+
+class Sam1Model(SamModel):
+    """Original Segment Anything (ViT-B/L/H), including micro_sam fine-tuned weights."""
+
+    def __init__(self, path: Path, state: dict, device: str):
+        from segment_anything import sam_model_registry
+        from segment_anything.utils.transforms import ResizeLongestSide
+
+        self.path, self.device = path, device
+        try:
+            vit = _EMBED_DIM_TO_TYPE[state["image_encoder.pos_embed"].shape[-1]]
+        except KeyError:
+            raise ValueError(f"{path.name}: unsupported SAM image encoder") from None
+        self.model_type = f"SAM {vit}"
+        sam = sam_model_registry[vit](checkpoint=None)
+        sam.load_state_dict(state)
+        self.sam = sam.to(device).eval()
+        self.transform = ResizeLongestSide(sam.image_encoder.img_size)
+
+    @torch.inference_mode()
+    def embed(self, rgb: np.ndarray) -> Embedding:
+        resized = self.transform.apply_image(rgb)
+        x = torch.as_tensor(resized, device=self.device).permute(2, 0, 1)[None].float()
+        input_size = tuple(x.shape[-2:])
+        features = self.sam.image_encoder(self.sam.preprocess(x))
+        return Embedding(features, rgb.shape[:2], input_size, _nbytes(features))
+
+    def _decode(self, emb, points, box, multimask):
+        sam, dev = self.sam, self.device
+        pts, bx = _prompt_arrays(points, box)
+        if pts is not None:
+            xy = self.transform.apply_coords(pts[0], emb.original_size)
+            pts = (
+                torch.as_tensor(xy, dtype=torch.float, device=dev)[None],
+                torch.as_tensor(pts[1], dtype=torch.int, device=dev)[None],
+            )
+        if bx is not None:
+            bx = self.transform.apply_boxes(bx[None], emb.original_size)
+            bx = torch.as_tensor(bx, dtype=torch.float, device=dev)
+        sparse, dense = sam.prompt_encoder(points=pts, boxes=bx, masks=None)
+        low_res, iou = sam.mask_decoder(
+            image_embeddings=emb.features,
+            image_pe=sam.prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=multimask,
+        )
+        return low_res, iou[0]
+
+    def _upsample(self, low_res, emb):
+        return self.sam.postprocess_masks(low_res, emb.input_size, emb.original_size)
+
+
+# (patch embedding width, number of trunk blocks) -> config name suffix
+_SAM2_SIZES = {(96, 12): "t", (96, 16): "s", (112, 24): "b+", (144, 48): "l"}
+_SAM2_NAMES = {"t": "tiny", "s": "small", "b+": "base+", "l": "large"}
+
+
+class Sam2Model(SamModel):
+    """SAM 2 / SAM 2.1 (Hiera), used as a per-image model: embed once, then decode prompts."""
+
+    def __init__(self, path: Path, state: dict, device: str):
+        try:
+            from sam2.build_sam import build_sam2
+            from sam2.utils.transforms import SAM2Transforms
+        except ImportError:
+            raise ValueError(
+                f"{path.name} is a SAM 2 checkpoint, but the 'sam2' package is not installed"
+            ) from None
+
+        self.path, self.device = path, device
+        width = state["image_encoder.trunk.patch_embed.proj.weight"].shape[0]
+        blocks = len({k.split(".")[3] for k in state if k.startswith("image_encoder.trunk.blocks.")})
+        try:
+            size = _SAM2_SIZES[(width, blocks)]
+        except KeyError:
+            raise ValueError(f"{path.name}: unrecognised SAM 2 model size") from None
+        version = "sam2.1" if "no_obj_embed_spatial" in state else "sam2"
+        self.model_type = f"SAM {version[3:]} {_SAM2_NAMES[size]}"
+        model = build_sam2(f"configs/{version}/{version}_hiera_{size}.yaml", None, device=device)
+        model.load_state_dict(state)
+        self.sam = model
+        with warnings.catch_warnings():  # sam2 scripts its transforms with a deprecated API
+            warnings.simplefilter("ignore", FutureWarning)
+            self.transform = SAM2Transforms(resolution=model.image_size, mask_threshold=0.0)
+        n = model.image_size // 4  # the three feature maps have strides 4, 8 and 16
+        self._feat_sizes = [(n, n), (n // 2, n // 2), (n // 4, n // 4)]
+
+    @torch.inference_mode()
+    def embed(self, rgb: np.ndarray) -> Embedding:
+        m = self.sam
+        x = self.transform(rgb)[None].to(self.device)  # squashed to a square, unlike SAM 1
+        _, feats, _, _ = m._prepare_backbone_features(m.forward_image(x))
+        if m.directly_add_no_mem_embed:
+            feats[-1] = feats[-1] + m.no_mem_embed
+        feats = [
+            f.permute(1, 2, 0).reshape(1, -1, *size) for f, size in zip(feats, self._feat_sizes)
+        ]
+        # the decoder also uses the two finer maps; halve their footprint, they dominate it
+        features = {"image_embed": feats[-1], "high_res": [f.half() for f in feats[:-1]]}
+        size = (m.image_size, m.image_size)
+        return Embedding(features, rgb.shape[:2], size, _nbytes(feats[-1], *features["high_res"]))
+
+    def _decode(self, emb, points, box, multimask):
+        m, dev = self.sam, self.device
+        h, w = emb.original_size
+        scale = np.array([m.image_size / w, m.image_size / h], dtype=np.float32)
+        pts, bx = _prompt_arrays(points, box)
+        coords, labels = [], []
+        if bx is not None:  # a box is passed as two specially labelled corner points
+            coords.append(bx.reshape(2, 2) * scale)
+            labels.append(np.array([2, 3], dtype=np.int32))
+        if pts is not None:
+            coords.append(pts[0] * scale)
+            labels.append(pts[1])
+        concat = (
+            torch.as_tensor(np.concatenate(coords), dtype=torch.float, device=dev)[None],
+            torch.as_tensor(np.concatenate(labels), dtype=torch.int, device=dev)[None],
+        )
+        sparse, dense = m.sam_prompt_encoder(points=concat, boxes=None, masks=None)
+        low_res, iou, _, _ = m.sam_mask_decoder(
+            image_embeddings=emb.features["image_embed"],
+            image_pe=m.sam_prompt_encoder.get_dense_pe(),
+            sparse_prompt_embeddings=sparse,
+            dense_prompt_embeddings=dense,
+            multimask_output=multimask,
+            repeat_image=False,
+            high_res_features=[f.float() for f in emb.features["high_res"]],
+        )
+        return low_res, iou[0]
+
+    def _upsample(self, low_res, emb):
+        return F.interpolate(low_res.float(), emb.original_size, mode="bilinear", align_corners=False)
+
+
+def load_model(path: str | Path, device: str | None = None) -> SamModel:
+    """Load a checkpoint, picking the backend from its contents."""
+    path = Path(path)
+    device = device or pick_device()
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict):
+        raise ValueError(f"{path.name} is not a model checkpoint")
+    if "model_state" in state:  # micro_sam fine-tuning checkpoints wrap the weights
+        state = {k.removeprefix("sam."): v for k, v in state["model_state"].items()}
+    elif isinstance(state.get("model"), dict):
+        state = state["model"]
+    if "image_encoder.pos_embed" in state:
+        return Sam1Model(path, state, device)
+    if "image_encoder.trunk.patch_embed.proj.weight" in state:
+        return Sam2Model(path, state, device)
+    raise ValueError(f"{path.name} is not a SAM or SAM 2 checkpoint")
 
 
 class EmbedWorker(QThread):
