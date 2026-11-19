@@ -4,3 +4,4 @@ __pycache__/
 dist/
 *_labels.tif
 models/
+test_data/

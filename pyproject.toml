@@ -21,5 +21,19 @@ dependencies = [
 slugsam = "slugsam.app:main"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["uv_build>=0.13.5,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = ""
+
+# PyPI only has CPU builds of torch for Windows; take the CUDA build from PyTorch's own index
+# there. Linux keeps PyPI, whose wheels already bundle CUDA; macOS keeps PyPI (MPS).
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu132", marker = "sys_platform == 'win32'" }]
